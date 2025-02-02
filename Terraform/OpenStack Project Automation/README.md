@@ -7,6 +7,9 @@ This project
 * Connects the internal network to the router
 * Creates a server
 * Deploys Nextcloud on the server with a userdata script
+* Creates all necessary firewall rules for Nextcloud
+* Associate a floating ip (public ip)
+* Return the public ip and the associated .nip.io address
 
 # Dependencies
 This automation is built on a combination of tools and technologies.
