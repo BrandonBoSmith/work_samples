@@ -1,6 +1,6 @@
 # OpenStack Hosted NextCloud Image
 Here is an example of a project that was completed for a client.
-This project creates
+This project
 * Creates an OpenStack project
 * Creates a network
 * Creates a router
