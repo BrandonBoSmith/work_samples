@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+###############################################################################
+'''
+ Description: 		Nagios/Opsview plugin that monitors the status of Palo
+			Alto Firewall system envionmentals using the Palo Alto
+			XML API
+ Author:		Bo Smith (bo@bosmith.tech)
+ Creation Date:	2018-08-28
+ Requirements:		Requires a Palo Alto admin api key.  Highly recommend
+			readonly permission be applied.
+ Source: https://www.paloaltonetworks.com/documentation/71/pan-os/xml-api/get-started-with-the-pan-os-xml-api/get-your-api-key
+'''
+import sys
+import argparse
+import xml.etree.ElementTree as ET
+import requests
+import urllib3
+import sys
+import re
+import pprint
+# Uncomment to re-enable warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Parse Arguments
+###############################################################################
+parser = argparse.ArgumentParser(
+    prog='check_pan_environmentals',
+    usage='%(prog)s [-H] [-w] [-c]',
+    description='Plugin for monitoring system environmental status')
+parser.add_argument('-H', '--host', action='store', required=True, metavar='',
+                    help='Hostname or IP Address of the Firewall (Required)')
+parser.add_argument('-k', '--key', action='store', required=True, metavar='',
+                    help='API Key (Required)')
+parser.add_argument('-C', '--connecttime', action='store', required=False, metavar='',
+                    help='Connection timeout in seconds (default is 10 if not set)', default=10)
+parser.add_argument('-w', '--warning', action='store_true', required=False,
+                    help='Issue a warning alert of a tunnel is down', default=True)
+parser.add_argument('-c', '--critical', action='store_true', required=False,
+                    help='Issue a critical alert of a tunnel is down', default=False)
+args = parser.parse_args()
+host = args.host
+key = args.key
+conntime = int(args.connecttime)
+warn = args.warning
+crit = args.critical
+STATE_OK = 0
+STATE_WARNING = 1
+STATE_CRITICAL = 2
+STATE_UNKNOWN = 3
+
+
+# Request environmentals data from api
+###############################################################################
+def get_env_data(host, key):
+    url = 'https://' + host + '/api/?type=op&cmd='
+    url += '<show><system><environmentals>'
+    url += '</environmentals></system></show>'
+    url += '&key=' + key
+    try:
+        data = requests.get(url, verify=False, timeout=conntime)
+        data.raise_for_status()
+    except requests.exceptions.RequestException as err:
+        alert_unknown('Exception encountered ' + str(err))
+    return(data.content)
+
+
+# Get environment data from XML DOM
+###############################################################################
+def get_env_info(data):
+    all_env = []
+    dom = ET.fromstring(data)
+    fantray = dom.findall('./result/fantray')
+    powersupply = dom.findall('./result/power-supply')
+    thermal = dom.findall('./result/thermal')
+    fan = dom.findall('./result/fan')
+    power = dom.findall('./result/power')
+    for line in fantray:
+        environment = {}
+        environment['list'] = []
+        environment["type"] = line.tag
+        for item in line:
+            slot = item.tag
+            entries = dom.findall('./result/fantray/' + slot + '/entry')
+            for entry in entries:
+                env = {}
+                env["slot"] = entry.find('slot').text
+                env["alarm"] = entry.find('alarm').text
+                env["description"] = entry.find('description').text
+                environment['list'].append(env)
+        all_env.append(environment)
+    for line in powersupply:
+        environment = {}
+        environment['list'] = []
+        environment["type"] = line.tag
+        for item in line:
+            slot = item.tag
+            entries = dom.findall('./result/power-supply/' + slot + '/entry')
+            for entry in entries:
+                env = {}
+                env["slot"] = entry.find('slot').text
+                env["alarm"] = entry.find('alarm').text
+                env["description"] = entry.find('description').text
+                environment['list'].append(env)
+        all_env.append(environment)
+
+    for line in thermal:
+        environment = {}
+        environment['list'] = []
+        environment["type"] = line.tag
+        for item in line:
+            slot = item.tag
+            entries = dom.findall('./result/thermal/' + slot + '/entry')
+            for entry in entries:
+                env = {}
+                env["slot"] = entry.find('slot').text
+                env["alarm"] = entry.find('alarm').text
+                env["description"] = entry.find('description').text
+                env["metric"] = entry.find('DegreesC').text
+                environment['list'].append(env)
+        all_env.append(environment)
+
+    for line in fan:
+        environment = {}
+        environment['list'] = []
+        environment["type"] = line.tag
+        for item in line:
+            slot = item.tag
+            entries = dom.findall('./result/fan/' + slot + '/entry')
+            for entry in entries:
+                env = {}
+                env["slot"] = entry.find('slot').text
+                env["alarm"] = entry.find('alarm').text
+                env["description"] = entry.find('description').text
+                env["metric"] = entry.find('RPMs').text
+                environment['list'].append(env)
+        all_env.append(environment)
+
+    for line in power:
+        environment = {}
+        environment['list'] = []
+        environment["type"] = line.tag
+        for item in line:
+            slot = item.tag
+            entries = dom.findall('./result/power/' + slot + '/entry')
+            for entry in entries:
+                env = {}
+                env["slot"] = entry.find('slot').text
+                env["alarm"] = entry.find('alarm').text
+                env["description"] = entry.find('description').text
+                env["metric"] = entry.find('Volts').text
+                environment['list'].append(env)
+        all_env.append(environment)
+    return(all_env)
+
+
+# Remove special characters
+###############################################################################
+def remove_chars(info):
+    new = []
+    for env in info:
+        newinfo = {}
+        newinfo["type"] = env["type"]
+        newinfo["list"] = []
+        for i in env["list"]:
+            i["description"] = i["description"].replace(" @ ", "_")
+            i["description"] = i["description"].replace("#", "")
+            i["description"] = i["description"].replace("[", "")
+            i["description"] = i["description"].replace("]", "")
+            i["description"] = i["description"].replace("#", "")
+            i["description"] = i["description"].replace("(", "")
+            i["description"] = i["description"].replace(")", "")
+            i["description"] = i["description"].replace(" ", "_")
+            newinfo["list"].append(i)
+        new.append(newinfo)
+    return(new)
+
+# Parse info and issue any alerts
+###############################################################################
+
+
+def parse_info(info):
+    output = ""
+    alerts = []
+    perfdata = " |"
+    for env in info:
+        totalcount = env["list"]
+        alertcount = 0
+        for i in env["list"]:
+            if "metric" in i:
+                perfdata += " " + i["description"] + "=" + i["metric"]
+            if i["alarm"] == "True":
+                alertcount += 1
+                alerts.append(i)
+    if len(alerts) > 0:
+        num = 0
+        for line in alerts:
+            count = len(alerts)
+            if num == 0:
+                output += str(count) + " Alerts: " + line["description"]
+                num += 1
+            else:
+                output += ", " + line["description"]
+                num += 1
+        if crit:
+            alert_critical(output + perfdata)
+        elif warn:
+            alert_warning(output + perfdata)
+    else:
+        alert_ok('No hardware alerts reported ' + perfdata)
+
+
+# Alert Handling Functions
+###############################################################################
+def alert_ok(output):
+    print('OK - {}'.format(output))
+    sys.exit(STATE_OK)
+
+
+def alert_warning(output):
+    print('WARNING - {}'.format(output))
+    sys.exit(STATE_WARNING)
+
+
+def alert_critical(output):
+    print('CRITICAL - {}'.format(output))
+    sys.exit(STATE_CRITICAL)
+
+
+def alert_unknown(output):
+    print('UNKNOWN - {}'.format(output))
+    sys.exit(STATE_UNKNOWN)
+
+
+# MAIN (Let it begin, LET IT BEGIN!)
+###############################################################################
+env_data = get_env_data(host, key)
+env_info = get_env_info(env_data)
+env_info = remove_chars(env_info)
+parse_info(env_info)

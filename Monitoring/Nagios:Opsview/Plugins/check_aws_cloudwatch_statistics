@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+##############################################################################
+'''
+Description:	Opsview/Nagios plugin used to monitor AWS Application Load 
+                Balancers.  check_aws_cloudwatch seems to only check classic
+                balancers.
+Requirements:	AWS Item            Opsview Variable
+                Access Key          %AWS_CLOUDWATCH_AUTHENTICATION:2%
+                Secret Key          %AWS_CLOUDWATCH_AUTHENTICATION:3%
+                Load Balancer Name  %AWS_ELB_LOAD_BALANCER_NAME%
+                Dimension           %AWS_METRIC_DIMENSIONS:1%
+                    Example 'Name=LoadBalancer,Value=app/lbname/1234566
+                    Value can be obtained from CloudWatch -> AWS/ApplicationELB
+                Metric Name         
+Created:	    2019-06-12
+Author:		    Bo Smith (bo@bosmith.tech)
+'''
+##############################################################################
+import boto3
+import pprint
+import argparse
+import sys
+from datetime import datetime, timedelta
+
+ok = 0
+warn = 1
+crit = 2
+unknown = 3
+
+
+# Get arguments
+##############################################################################
+def get_args():
+    parser = argparse.ArgumentParser(
+        usage='%(prog)s [-H] [-u] [-p]',
+        description='Opsview plugin to monitor AWS Application ELB')
+    parser.add_argument('-A', '--accesskey', action='store', required=True,
+                        help='Access key')
+    parser.add_argument('-S', '--secretkey', action='store', required=True,
+                        help='Secret Key')
+    parser.add_argument('-M', '--metric', action='store', required=True,
+                        help='Metric to retrieve')
+    parser.add_argument('-N', '--name', action='store', required=True,
+                        help='Name of the load balancer')
+    parser.add_argument('-a', '--availabilityzone', action='store',
+                        required=False,
+                        help='Availability Zone to get metrics for')
+    parser.add_argument('-t', '--targetgroup', action='store', required=False,
+                        help='Target Group to get metrics for')
+    parser.add_argument('-s', '--statistics', action='store', required=True,
+                        choices=['SampleCount', 'Average', 'Sum', 'Minimum',
+                                 'Maximum'], help='Cloudwatch statistic')
+    parser.add_argument('-r', '--region', action='store', required=True,
+                        help='AWS Region')
+    parser.add_argument('-w', '--warning', action='store', required=False,
+                        type=float, help='Warning threshold in percentage')
+    parser.add_argument('-c', '--critical', action='store', required=False,
+                        type=float, help='Critical threshold in percentage')
+    parser.add_argument('-C', '--comparison', action='store', required=False,
+                        help='Comparison operator to use with thresholds',
+                        choices=['gt', 'lt'])
+    parser.add_argument('-E', '--empty', action='store', required=False,
+                        default='ok',
+                        help='Alert level if a result is empty (default = none)',
+                        choices=['critical', 'warning', 'unknown', 'ok'])
+    args = parser.parse_args()
+    return(args)
+
+
+# Get Cloudwatch Metrics
+##############################################################################
+def get_metrics(args):
+    dimension_data = [{'Name': 'LoadBalancer',
+                       'Value': args.name}]
+    if args.availabilityzone:
+        dimension_data.append({'Name': 'AvailabilityZone',
+                               'Value': args.availabilityzone})
+    if args.targetgroup:
+        dimension_data.append({'Name': 'TargetGroup',
+                               'Value': args.targetgroup})
+    endtime = datetime.now()
+    starttime = endtime - timedelta(seconds=300)
+    try:
+        client = boto3.client('cloudwatch',
+                              aws_access_key_id=args.accesskey,
+                              aws_secret_access_key=args.secretkey,
+                              region_name=args.region)
+    except Exception as err:
+        send_unknown('ERROR - '+str(err))
+    try:
+        response = client.get_metric_statistics(Dimensions=dimension_data,
+                                                MetricName=args.metric,
+                                                Namespace='AWS/ApplicationELB',
+                                                StartTime=starttime,
+                                                EndTime=endtime,
+                                                Period=300,
+                                                Statistics=[args.statistics])
+    except Exception as err:
+        send_unknown('ERROR - '+str(err))
+    return(response['Datapoints'])
+
+
+# Process Critical
+##############################################################################
+def process_critical(metrics, args):
+    if args.critical:
+        if args.comparison == 'lt':
+            print('less than')
+        elif args.comparison == 'gt':
+            print('greater than')
+    elif args.warning:
+        if args.comparison == 'lt':
+            print('less than')
+        elif args.comparison == 'gt':
+            print('greater than')
+    else:
+        print('OK')
+
+
+# Process Warning
+##############################################################################
+def process_warning(metrics, args):
+    if args.warning:
+        if args.comparison == 'lt':
+            print('less than')
+        elif args.comparison == 'gt':
+            print('greater than')
+    else:
+        print('OK')
+
+
+# Process Metrics
+##############################################################################
+def process_metrics(metrics, args):
+    data = {args.metric: metrics[0][args.statistics]}
+    if args.empty == 'ok':
+        # If we get an empty metric, set it to 0.0 and send OK
+        if metrics[0][args.statistics] == []:
+            value = '0.0'
+            message = args.metric+': ' + \
+                str(value)+' | '+args.metric+'='+str(value)
+            send_ok(message)
+    # TODO Next, get critical alerts figured out
+    elif (args.empty == 'critical' or args.critical):
+        process_critical(metrics, args)
+    elif (args.empty == 'warning' or args.warning):
+        process_warning(metrics, args)
+    elif args.empty == 'unknown':
+        send_unknown('empty results')
+
+
+# check_healthy_host_count
+##############################################################################
+def check_healthy_host_count(metrics, args):
+    pprint.pprint(metrics[0][args.statistics])
+    message = 'Healthy Host Count is '+str(metrics[0][args.statistics])
+    message += ' | healthy_host_count='+str(metrics[0][args.statistics])
+    if args.critical:
+        if metrics[args.statistics] < args.critical:
+            send_critical(message)
+    elif args.warning:
+        if metrics[args.statistics] < args.warning:
+            send_warning(message)
+    else:
+        send_ok(message)
+
+
+# Alert Functions
+##############################################################################
+def send_warning(message):
+    print('WARNING - '+message)
+    sys.exit(warn)
+
+
+def send_critical(message):
+    print('CRITICAL - '+message)
+    sys.exit(crit)
+
+
+def send_ok(message):
+    print('OK - '+message)
+    sys.exit(ok)
+
+
+def send_unknown(message):
+    print('UNKNOWN - '+message)
+    sys.exit(unknown)
+
+
+# Git-r-done!
+##############################################################################
+def main():
+    args = get_args()
+    metrics = get_metrics(args)
+    process_metrics(metrics, args)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+##############################################################################
+'''
+This nagios/opsview plugin uses the purestorage module released by Pure
+https://support.purestorage.com/Solutions/Python_REST_Client
+
+Author: Bo Smith (bo@bosmith.tech)
+
+Creation Date: 2018-05-26
+'''
+
+# Modules
+##############################################################################
+import purestorage
+import argparse
+from datetime import datetime, timedelta
+import pprint
+import sys
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Parse Arguments
+##############################################################################
+parser = argparse.ArgumentParser(
+    prog='check_purestorage',
+    usage='%(prog)s [-H] [-m] [-w] [-c]',
+    description='Checks health metrics from a Pore Storage appliance')
+parser.add_argument('-H', '--hostname', action='store', required=True, metavar='',
+                    help='Hostname or IP Address of the Purse Storage Array (Required)')
+parser.add_argument('-a', '--apikey', action='store', required=True, metavar='',
+                    help='API Key')
+parser.add_argument('-A', '--alertage', action='store', default=10, required=False, metavar='',
+                    help='Alert age in minutes (Used with \'alert\' mode)')
+parser.add_argument('-m', '--mode', action='store', required=True, metavar='',
+                    help='Mode: which health metrics to check (Required) Use -m help to print a list of modes')
+parser.add_argument('-s', '--systemmax', action='store', default=0, required=False, metavar='',
+                    help='System space threshold percent (Required for \'space\' mode)')
+parser.add_argument('-w', '--warning', action='store', default=1, metavar='',
+                    help='Warning threshold.  Use 1 or 0 to enable warnings for hardware checks (default enabled)')
+parser.add_argument('-c', '--critical', action='store', default=0, metavar='',
+                    help='Critical threshold.  Use 1 or 0 to enable criticals for hardware checks (default disabled)')
+args = parser.parse_args()
+host = args.hostname
+apikey = args.apikey
+age = int(args.alertage)
+mode = args.mode
+systemmax = int(args.systemmax)
+warn = int(args.warning)
+crit = int(args.critical)
+STATE_OK = 0
+STATE_WARNING = 1
+STATE_CRITICAL = 2
+STATE_UNKNOWN = 3
+
+
+# Modes
+##############################################################################
+# Overall Hardware Health
+def array_session(host, apikey):
+    try:
+        array = purestorage.FlashArray(host, api_token=apikey)
+    except Exception as err:
+        print('UNKNOWN - Error communicating with the array '+str(err))
+        sys.exit(STATE_UNKNOWN)
+    return(array)
+
+
+def check_hardware_health(array):
+    alert = ''
+    count = 0
+    try:
+        hardware = array.list_hardware()
+    except Exception as err:
+        print('UNKNOWN - Error communicating with the array '+str(err))
+        sys.exit(STATE_UNKNOWN)
+    for item in hardware:
+        name = item['name']
+        slot = item['slot']
+        status = item['status']
+        temp = item['temperature']
+        volts = item['voltage']
+        details = item['details']
+        if status != 'ok' and status != 'not_installed':
+            if count > 0:
+                alert += ', '
+            alert += 'Name: {} Slot: {} Status: {}'.format(name, slot, status)
+            if temp != None:
+                alert += ' Temperature: {}'.format(temp)
+            if volts != None:
+                alert += ' Voltage: {}'.format(volts)
+            if details != None:
+                alert += ' Details: {}'.format(details)
+            count += 1
+    if alert != '':
+        if crit > 0:
+            alert_critical(alert)
+        else:
+            alert_warning(alert)
+    else:
+        alert_ok('All hardware is healthy')
+    end_session(array)
+
+
+# Physical Drive Health
+def check_drive_health(array):
+    alert = ''
+    count = 0
+    try:
+        drives = array.list_drives()
+    except Exception as err:
+        print('UNKNOWN - Error communicating with the array '+str(err))
+        sys.exit(STATE_UNKNOWN)
+    for drive in drives:
+        name = drive['name']
+        status = drive['status']
+        drivetype = drive['type']
+        details = drive['details']
+        if status != 'healthy' and status != 'unused':
+            if count > 0:
+                alert += ', '
+            alert += 'Name: {} Type: {} Status: {}'.format(
+                name, drivetype, status)
+            if details != None:
+                alert += ' Details: {}'.format(details)
+            count += 1
+    if alert != '':
+        if crit > 0:
+            alert_critical(alert)
+        else:
+            alert_warning(alert)
+    else:
+        alert_ok('All drives are healthy')
+
+    end_session(array)
+
+
+# Check Space
+def check_space(array):
+    perfdata = ''
+    crit_alert = ''
+    warn_alert = ''
+    try:
+        space = array.get(space=True)
+    except Exception as err:
+        print('UNKNOWN - Error occurred communicating with the array: '+str(err))
+        sys.exit(STATE_UNKNOWN)
+    space = space[0]
+    system = (100 * space['system'] / space['capacity'])
+    array_usage = (100 * space['total'] / space['capacity'])
+    perfdata = ' | system_pct={} array_use_pct={}'.format(system, array_usage)
+    if system >= systemmax:
+        if crit > 0:
+            crit_alert += 'System space is {}%'.format(system)
+        else:
+            warn_alert += 'System space is {}%'.format(system)
+    if crit:
+        if array_usage >= crit:
+            crit_alert += 'Array Usage is {}%'.format(array_usage)
+        elif array_usage >= warn:
+            warn_alert += 'Array Usage is {}%'.format(array_usage)
+    elif array_usage >= warn:
+        warn_alert += 'Array Usage is {}%'.format(array_usage)
+    if crit_alert != '':
+        if warn_alert != '':
+            alert_critical(crit_alert+warn_alert+perfdata)
+        else:
+            alert_critical(crit_alert+perfdata)
+    elif warn_alert != '':
+        alert_warning(warn_alert+perfdata)
+
+    else:
+        alert_ok('System space usage: {}% Array Usage: {}% {}'.format(
+            system, array_usage, perfdata))
+    end_session(array)
+
+
+# Check Volume Usage
+def check_volumes(array):
+    perfdata = ' | '
+    crit_alert = ''
+    warn_alert = ''
+    count = 0
+    try:
+        volumes = array.list_volumes(space=True)
+    except Exception as err:
+        print('UNKNOWN - Error occurred communicating with the array: '+str(err))
+        sys.exit(STATE_UNKNOWN)
+    # pprint.pprint(volumes)
+    for volume in volumes:
+        total = volume['total']
+        size = volume['size']
+        name = volume['name']
+        pct_used = (100 * total / size)
+        perfdata += name+'_pct='+str(pct_used)+' '
+        if (crit != 0 and pct_used >= crit):
+            if count > 0:
+                crit_alert += ', '
+            crit_alert += 'Name: {} Total: {} Size: {} Pct_Used: {}'.format(
+                name, total, size, pct_used)
+            count += 1
+        elif (warn != 1 and pct_used >= warn):
+            if count > 0:
+                warn_alert += ', '
+            warn_alert += 'Name: {} Total: {} Size: {} Pct_Used: {}'.format(
+                name, total, size, pct_used)
+            count += 1
+    if crit_alert:
+        if warn_alert:
+            alert_critical(crit_alert+warn_alert+perfdata)
+        else:
+            alert_critical(crit_alert+perfdata)
+    elif warn_alert:
+        alert_warning(warn_alert+perfdata)
+    else:
+        alert_ok('All volumes are within limits'+perfdata)
+
+    end_session(array)
+
+
+# Check controller status
+def check_controllers(array):
+    alert = ''
+    ok = ''
+    count = 0
+    controllers = array.get(controllers=True)
+    for controller in controllers:
+        name = controller['name']
+        status = controller['status']
+        mode = controller['mode']
+        version = controller['version']
+        if status != 'ready':
+            if count > 0:
+                alert += ', '
+            alert += 'Name: {} Mode: {} Ver: {} Status: {}'.format(
+                name, mode, version, status)
+            count += 1
+        else:
+            if count > 0:
+                ok += ', '
+            ok += 'Name: {} Mode: {} Ver: {} Status: {}'.format(
+                name, mode, version, status)
+            count += 1
+    if alert != '':
+        if crit > 0:
+            alert_critical(alert)
+        else:
+            alert_warning(alert)
+    else:
+        alert_ok(ok)
+
+    end_session(array)
+
+
+# Check the array overall performance metrics
+def check_performance(array):
+    # Gather metrics only, no alerting
+    perfdata = '| '
+    perf = array.get(action='monitor')
+    perf = perf[0]
+    status = 'Input p/sec: {}, Output p/sec: {}, '.format(
+        perf['input_per_sec'], perf['output_per_sec'])
+    status += 'Queue Depth: {}, Reads p/sec: {}, '.format(
+        perf['queue_depth'], perf['reads_per_sec'])
+    status += 'Writes p/sec: {}, Usec p/read op: {}, Usec p/write op: {} '.format(
+        perf['writes_per_sec'], perf['usec_per_read_op'], perf['usec_per_write_op'])
+    perfdata += 'input_per_sec=' + \
+        str(perf['input_per_sec'])+' output_per_sec=' + \
+        str(perf['output_per_sec'])
+    perfdata += ' queue_depth=' + \
+        str(perf['queue_depth'])+' reads_per_sec='+str(perf['reads_per_sec'])
+    perfdata += ' writes_per_sec='+str(perf['writes_per_sec'])+' usec_per_read_op='+str(
+        perf['usec_per_read_op'])+' usec_per_write_op='+str(perf['usec_per_write_op'])
+    alert_ok(status+perfdata)
+    end_session(array)
+
+
+# Check the array for any alerts
+def check_alerts(array):
+    alert_list = []
+    alert = ''
+    count = 0
+    now = datetime.utcnow()
+    t_delta = now - timedelta(minutes=age)
+    try:
+        messages = array.list_messages()
+    except Exception as err:
+        alert_warning('Unable to get alerts '+str(err))
+    for message in messages:
+        opened_time = message['opened'].replace('T', ' ')
+        opened_time = opened_time.replace('Z', '')
+        opened_time = datetime.strptime(opened_time, '%Y-%m-%d %H:%M:%S')
+        if opened_time >= t_delta:
+            alert_list.append(message)
+
+    if alert_list != []:
+        for i in alert_list:
+            cname = i['component_name']
+            ctype = i['component_type']
+            sev = i['current_severity']
+            event = i['event']
+            event_id = i['id']
+            if count > 0:
+                alert += ', '
+            alert += 'Alert {} {} in {} {}'.format(sev, event, ctype, cname)
+            count += 1
+    if any(d['current_severity'] == 'critical' for d in alert_list):
+        alert_critical(alert)
+    elif any(d['current_severity'] == 'warning' for d in alert_list):
+        alert_warning(alert)
+    else:
+        alert_ok('No alerts reported in the last {} minutes'.format(age))
+    end_session(array)
+
+
+# Function to end the session
+def end_session(array):
+    array.invalidate_cookie()
+
+
+# Alert Functions
+##############################################################################
+def alert_warning(message):
+    print('WARNING - '+message)
+    sys.exit(STATE_WARNING)
+
+
+def alert_critical(message):
+    print('CRITICAL - '+message)
+    sys.exit(STATE_CRITICAL)
+
+
+def alert_ok(message):
+    print('OK - '+message)
+    sys.exit(STATE_OK)
+
+
+# Main
+##############################################################################
+# Setup Array Session
+array = array_session(host, apikey)
+
+# Run a check based on -m/--mode option
+if mode == 'help':
+    print('Available modes:')
+    print('\t\'alerts\'\tChecks the array for messages in the last ten minutes (Use -A|--alertage to override age)')
+    print('\t\t\tAlerts levels are determined by array alert severity, warning/critical.')
+    print('\t\'controllers\'\tChecks the status of the contollers')
+    print('\t\'drives\'\tChecks health of all drives (Ignores \'unused\' drives)')
+    print('\t\'hardware\'\tChecks hardware health (Ignores \'not_installed\' hardware)')
+    print('\t\'performance\'\tGathers array performance metrics (No alerting)')
+    print('\t\'space\'\t\tChecks space usage of the array')
+    print('\t\'volumes\'\tChecks volume usage of the array')
+elif mode == 'alerts':
+    if age == None:
+        print('Mode \'alerts\' requires the \'age\' argument. Run -m help')
+        sys.exit(1)
+    check_alerts(array)
+elif mode == 'controllers':
+    check_controllers(array)
+elif mode == 'drives':
+    check_drive_health(array)
+elif mode == 'hardware':
+    check_hardware_health(array)
+elif mode == 'performance':
+    check_performance(array)
+elif mode == 'space':
+    check_space(array)
+elif mode == 'volumes':
+    check_volumes(array)
+else:
+    parser.print_help()

@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+###############################################################################
+'''
+Description:        Opsview Monitoring plugin that will be used to monitor
+                    Google Cloud HTTPS Load Balancer healthy host status
+Author:             Bo Smith (bo@bosmith.tech), Dusty Day (dustyday@gmail.com)
+Date:               2020-09-04
+Requirements:       python3, google-api-python-client, google-auth
+                    json file for a service account
+'''
+###############################################################################
+
+import argparse
+import json
+import sys
+from pprint import pprint
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+
+ok = 0
+warn = 1
+crit = 2
+unknown = 3
+
+
+# Get Args
+###############################################################################
+def get_args():
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description='Opsview plugin to monitor GCP Load Balancer healthy host count\n\n'
+        'This plugin can check for actual host count or a percentage of hosts in the group.\n',
+        epilog='Examples:\n'
+        'CHECK FOR ACTUAL HOST COUNT\n'
+        'Warn if healthy host count is 2 or less, Critical if 1 or less.\n'
+        '    check_gcp_https_healthy_host -l my-prod-loadbalancer-name \\ \n'
+        '        -p my-project -r us-east1 -j svc_acct_creds.json -w 2 -c 1\n'
+        'CHECK FOR PERCENTAGE OF TOTAL HOSTS\n'
+        'Warn if healthy host percentage is 50% or less, Critical if 25% or less.\n'
+        '    check_gcp_https_healthy_host -l my-prod-loadbalancer-name \\ \n'
+        '        -p my-project -r us-east1 -j svc_acct_creds.json -w 50 -c 25\n'
+    )
+    required = parser.add_argument_group('required options')
+    output = parser.add_argument_group('output options')
+    threshold = parser.add_argument_group('threshold options')
+
+    required.add_argument(
+        '-j',
+        '--jsonfile',
+        action='store',
+        required=True,
+        help='JSON File with service_account creds.\n'
+             'Must exist in plugins directory unless full path included.'
+    )
+    required.add_argument(
+        '-p',
+        '--project',
+        action='store',
+        required=True,
+        help='GCP Project ID',
+    )
+    required.add_argument(
+        '-l',
+        '--loadbalancer',
+        action='store',
+        required=True,
+        help='Load balancer name as shown in the console or via\n'
+             'gcloud compute url-maps list',
+    )
+    # output options
+    output.add_argument(
+        '-d',
+        '--debug',
+        action='store_true',
+        default=False,
+        required=False,
+        help='Show debug output',
+    )
+    output.add_argument(
+        '--format',
+        action='store',
+        choices=['percent', 'raw'],
+        default='raw',
+        required=False,
+        help='Format the returned value (Default is raw)\n'
+             'Note: This formatting is done before evaluating the threshold',
+    )
+    # thresholds
+    threshold.add_argument(
+        '-w',
+        '--warning',
+        action='store',
+        type=float,
+        required=False,
+        help='Warning threshold.',
+    )
+    threshold.add_argument(
+        '-c',
+        '--critical',
+        action='store',
+        type=float,
+        required=False,
+        help='Critical threshold.',
+    )
+
+    args = parser.parse_args()
+    return(args)
+
+
+# Setup Compute Object
+###############################################################################
+def setup_compute(args):
+    # Setup authenticated service. This will be used to make the api calls
+    try:
+        creds = service_account.Credentials.from_service_account_file(
+            args.jsonfile)
+        compute = build('compute', 'v1', credentials=creds)
+    except Exception as err:
+        send_unknown('Unable to authenticate '+str(err))
+    return(compute)
+
+
+# Get LB Backend Services
+###############################################################################
+def get_backends(args, compute):
+    # Get all the backends of the load balancer
+    backends = []
+    try:
+        u = compute.urlMaps().get(
+            project=args.project,
+            urlMap=args.loadbalancer
+        )
+        urlmap = u.execute()
+    except Exception as err:
+        send_unknown('Unable to retrieve backend services '+str(err))
+    # Get all the backend names into a list
+    # start with defaultService
+    backends.append(urlmap['defaultService'].split('/')[-1])
+    try:
+        for backend in urlmap['pathMatchers']:
+            name = backend['defaultService'].split('/')[-1]
+            if name not in backends:
+                backends.append(name)
+    except:
+        pass
+    return(backends)
+
+
+# Get Backend Health
+###############################################################################
+def get_backend_health(args, compute, backends):
+    health = {
+        'host_count': 0,
+        'healthy_host_count': 0,
+        'unhealthy_host_count': 0,
+        'unhealthy_hosts': []
+    }
+    for backendservice in backends:
+        try:
+            h = compute.backendServices().get(
+                project=args.project,
+                backendService=backendservice
+            )
+            results = h.execute()
+        except Exception as err:
+            send_unknown('Unable to check health of backend service '+str(err))
+        for backend in results['backends']:
+            b = compute.backendServices().getHealth(
+                project=args.project,
+                backendService=backendservice,
+                body={'group': backend['group']}
+            )
+            health_result = b.execute()
+            # Use a try/except block here to pass over backends that do
+            # not have instances
+            try:
+                health['host_count'] += len(health_result['healthStatus'])
+                for result in health_result['healthStatus']:
+                    if result['healthState'] == 'HEALTHY':
+                        health['healthy_host_count'] += 1
+                    else:
+                        host = result['instance'].split('/')[-1]
+                        health['unhealthy_hosts'].append(host)
+                        health['unhealthy_host_count'] += 1
+            except Exception as err:
+                pass
+    return(health)
+
+
+# Analyze the results
+##############################################################################
+def analyze_health(args, compute, health):
+    # Analyze and report the results
+    message = ''
+    if args.format == 'percent':
+        metric = round(
+            (health['healthy_host_count'] / health['host_count']) * 100, 2
+        )
+        metric_type = 'percentage'
+        unit = '%'
+    else:
+        metric = health['healthy_host_count']
+        metric_type = 'count'
+        unit = ''
+
+    # Prep the output message
+    message += 'Healthy host ' + metric_type + ' is ' + str(metric) + unit
+    if health['unhealthy_host_count'] > 0:
+        # Include the unhealthy instances if present
+        message += ' Unhealthy instances:' + str(health['unhealthy_hosts'])
+    # Tie it all together with a pretty lil bow and perf data
+    message += ' | healthy_host_count='+str(health['healthy_host_count'])
+    message += ' unhealthy_host_count='+str(health['unhealthy_host_count'])
+
+    # Evaluate thresholds
+    # If critical and warning args, evaluate critical first
+    if args.warning and args.critical:
+        if metric <= args.critical:
+            send_critical(message)
+        elif metric <= args.warning:
+            send_warning(message)
+        else:
+            send_ok(message)
+    # Critical args only
+    elif args.warning is None and args.critical:
+        if metric <= args.critical:
+            send_critical(message)
+        else:
+            send_ok(message)
+    # Warning args only
+    elif args.critical is None and args.warning:
+        if metric <= args.warning:
+            send_warning(message)
+        else:
+            send_ok(message)
+    # All good
+    else:
+        send_ok(message)
+
+
+# Alert Functions
+##############################################################################
+def send_warning(message):
+    print('WARNING - '+message)
+    sys.exit(warn)
+
+
+def send_critical(message):
+    print('CRITICAL - '+message)
+    sys.exit(crit)
+
+
+def send_ok(message):
+    print('OK - '+message)
+    sys.exit(ok)
+
+
+def send_unknown(message):
+    print('UNKNOWN - '+message)
+    sys.exit(unknown)
+
+
+# Main
+###############################################################################
+def main():
+    args = get_args()
+    compute = setup_compute(args)
+    backends = get_backends(args, compute)
+    health = get_backend_health(args, compute, backends)
+    analyze_health(args, compute, health)
+
+
+if __name__ == '__main__':
+    main()

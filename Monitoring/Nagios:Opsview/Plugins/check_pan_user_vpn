@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+###############################################################################
+'''
+ Description: 		Nagios/Opsview plugin that monitors the status of Palo
+			Alto Firewall End user VPN tunnels using the Palo Alto 
+			XML API
+ Author:		Bo Smith (bo@bosmith.tech)
+ Creation Date:	2018-08-22
+ Requirements:		Requires a Palo Alto admin api key.  Highly recommend
+			readonly permission be applied.
+ Source: https://www.paloaltonetworks.com/documentation/71/pan-os/xml-api/get-started-with-the-pan-os-xml-api/get-your-api-key
+'''
+###############################################################################
+import sys
+import argparse
+import xml.etree.ElementTree as ET
+import requests
+import urllib3
+import sys
+import re
+import pprint
+# Uncomment to re-enable warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Parse Arguments
+###############################################################################
+parser = argparse.ArgumentParser(
+    prog='check_pan_user_vpn',
+    usage='%(prog)s [-H] [-w] [-c]',
+    description='Plugin for monitoring user vpn connections')
+parser.add_argument('-H', '--host', action='store', required=True, metavar='',
+                    help='Hostname or IP Address of the Firewall (Required)')
+parser.add_argument('-k', '--key', action='store', required=True, metavar='',
+                    help='API Key (Required)')
+parser.add_argument('-C', '--connecttime', action='store', required=False, metavar='',
+                    help='Connection timeout in seconds (default is 10 if not set)', default=10)
+parser.add_argument('-w', '--warning', action='store', required=False,
+                    help='Number of tunnels to issue a warning alert', default=0)
+parser.add_argument('-c', '--critical', action='store', required=False,
+                    help='Number of tunnels to issue a critical alert', default=0)
+args = parser.parse_args()
+host = args.host
+key = args.key
+conntime = int(args.connecttime)
+warn = int(args.warning)
+crit = int(args.critical)
+STATE_OK = 0
+STATE_WARNING = 1
+STATE_CRITICAL = 2
+STATE_UNKNOWN = 3
+
+
+# Request HA data from api
+###############################################################################
+def get_ha_data(host, key):
+    url = 'https://'+host+'/api/?type=op&cmd='
+    url += '<show><high-availability><all>'
+    url += '</all></high-availability></show>'
+    url += '&key='+key
+    try:
+        data = requests.get(url, verify=False, timeout=conntime)
+        data.raise_for_status()
+    except requests.exceptions.RequestException as err:
+        alert_unknown('Exception encountered '+str(err))
+    return(data.content)
+
+
+# Request tunnel data from api
+###############################################################################
+def get_tun_data(host, key):
+    url = 'https://'+host+'/api/?type=op&cmd='
+    url += '<show><running><tunnel><flow><all>'
+    url += '</all></flow></tunnel></running></show>'
+    url += '&key='+key
+    try:
+        data = requests.get(url, verify=False, timeout=conntime)
+        data.raise_for_status()
+    except requests.exceptions.RequestException as err:
+        alert_unknown('Exception encountered '+str(err))
+    return(data.content)
+
+
+# Get HA status from XML DOM
+###############################################################################
+def get_ha_status(data):
+    dom = ET.fromstring(data)
+    try:
+        ha = dom.find('./result/group/local-info/state').text
+    except Exception as err:
+        ha = str(err)
+        alert_unknown('Unable to determine HA status '+str(err))
+    return(ha)
+
+
+# Get vpn data from XML DOM
+###############################################################################
+def get_vpn_info(data):
+    all_tunnels = []
+    dom = ET.fromstring(data)
+    try:
+        tunnels = dom.findall('./result/GlobalProtect-Gateway/entry')
+    except Exception as err:
+        alert_unknown('Unable to get GP entries '+str(err))
+    for tunnel in tunnels:
+        tun = {}
+        tuninfo = []
+        name = tunnel.find('name').text
+        users = tunnel.findall('users/entry')
+        for user in users:
+            intip = user.find('assigned-ip').text
+            tuninfo.append(intip)
+        tun['name'] = name
+        tun['entries'] = tuninfo
+        all_tunnels.append(tun)
+    return(all_tunnels)
+
+
+# Process status and issue any alerts
+###############################################################################
+def process_status(status):
+    output = ''
+    warncount = 0
+    critcount = 0
+    perfdata = ' | '
+    if status == []:
+        alert_ok('- There are no GlobalProtect entries on this firewall')
+    for vpn in status:
+        count = len(vpn['entries'])
+        perfdata += '{}={} '.format(vpn['name'].lower(), str(count))
+        if crit != 0:
+            if count >= crit:
+                output += ' - CRITICAL {} connections on {}'.format(
+                    str(count), vpn['name'])
+                critcount += 1
+            elif count >= warn:
+                output += ' - WARNING {} connections on {}'.format(
+                    str(count), vpn['name'])
+                warncount += 1
+            else:
+                output += ' - OK {} connections on {}'.format(
+                    str(count), vpn['name'])
+        elif warn != 0:
+            if count >= warn:
+                output += ' - WARNING {} connections on {}'.format(
+                    str(count), vpn['name'])
+                warncount += 1
+            else:
+                output += ' - OK {} connections on {}'.format(
+                    str(count), vpn['name'])
+        else:
+            output += ' - OK {} connections on {}'.format(
+                str(count), vpn['name'])
+    output += perfdata
+    if critcount > 0:
+        alert_critical(output)
+    elif warncount > 0:
+        alert_warning(output)
+    else:
+        alert_ok(output)
+
+# Alert Handling Functions
+###############################################################################
+
+
+def alert_ok(output):
+    print('OK {}'.format(output))
+    sys.exit(STATE_OK)
+
+
+def alert_warning(output):
+    print('WARNING {}'.format(output))
+    sys.exit(STATE_WARNING)
+
+
+def alert_critical(output):
+    print('CRITICAL {}'.format(output))
+    sys.exit(STATE_CRITICAL)
+
+
+def alert_unknown(output):
+    print('UNKNOWN {}'.format(output))
+    sys.exit(STATE_UNKNOWN)
+
+
+# MAIN (Let it begin, LET IT BEGIN!)
+###############################################################################
+ha_data = get_ha_data(host, key)
+ha_state = get_ha_status(ha_data)
+# if the firewall is currently passive, bail out
+if ha_state == 'passive':
+    alert_ok('Firewall is currently passive, not checking tunnels')
+
+tun_data = get_tun_data(host, key)
+status = get_vpn_info(tun_data)
+process_status(status)

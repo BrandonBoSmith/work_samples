@@ -1,0 +1,658 @@
+#!/usr/bin/env python3
+###############################################################################
+'''
+Description:        Opsview Monitoring plugin that will be used to monitor
+                    Google Cloud Compute Instance Snapshots.  The intent is
+                    to discover and report any failures in scheduled snapshots
+Author:             Bo Smith (bo@bosmith.tech), Dusty Day (dustyday@gmail.com)
+Date:               2020-09-08
+Requirements:       python3, google-api-python-client, google-auth
+                    json file for a service account
+'''
+###############################################################################
+
+import argparse
+import json
+import logging
+import sys
+from datetime import datetime, timedelta, timezone
+from pprint import pprint, pformat
+# Bail out gracefully if a module is not available
+try:
+    import isodate
+    from dateutil import parser
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+except Exception as err:
+    print('UNKNOWN - '+ str(err))
+    sys.exit(3)
+
+ok = 0
+warn = 1
+crit = 2
+unknown = 3
+
+# Global var for overall status
+status = []
+
+
+# Alert Functions
+##############################################################################
+def send_warning(message):
+    print('WARNING - '+message)
+    sys.exit(warn)
+
+
+def send_critical(message):
+    print('CRITICAL - '+message)
+    sys.exit(crit)
+
+
+def send_ok(message):
+    print('OK - '+message)
+    sys.exit(ok)
+
+
+def send_unknown(message):
+    print('UNKNOWN - '+message)
+    sys.exit(unknown)
+
+
+# Get Args
+###############################################################################
+def get_args():
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description='Opsview plugin to monitor GCP compute instance snapshot status\n\n',
+        epilog='Examples:\n'
+        'Warn if snapshot is not ready and time is less than 5 minutes\n'
+        '    check_gcp_compute_snapshot -i instance-name \\ \n'
+        '        -p my-project -z us-east1-a \\ \n'
+        '        -j svc_acct_creds.json \n'
+        'Critical if snapshot is not ready and time is less than 5 minutes\n'
+        '    check_gcp_compute_snapshot -i instance-name \\ \n'
+        '        -p my-project -z us-east1-a \\ \n'
+        '        -j svc_acct_creds.json \n'
+    )
+    required = parser.add_argument_group('required options')
+    threshold = parser.add_argument_group('threshold options')
+    output = parser.add_argument_group('output options')
+
+    required.add_argument(
+        '-j',
+        '--jsonfile',
+        action='store',
+        required=True,
+        help='JSON File with service_account creds.\n'
+    )
+    required.add_argument(
+        '-p',
+        '--project',
+        action='store',
+        required=True,
+        help='GCP Project ID',
+    )
+    required.add_argument(
+        '-i',
+        '--instance',
+        action='store',
+        required=True,
+        help='Instance name as shown in the console or via\n'
+             'gcloud compute instances list',
+    )
+    required.add_argument(
+        '-l',
+        '--lookback',
+        action='store',
+        required=False,
+        default=60,
+        type=int,
+        help='Lookback for zone operations in minutes (default 60)'
+    )
+    required.add_argument(
+        '-z',
+        '--zone',
+        action='store',
+        required=True,
+        help='Zone the instance lives in\n'
+    )
+    # thresholds
+    threshold.add_argument(
+        '-m',
+        '--missinglevel',
+        action='store',
+        default='warn',
+        choices=['warn', 'crit'],
+        required=False,
+        help='Threshold for missing snapshots',
+    )
+    threshold.add_argument(
+        '-f',
+        '--failedlevel',
+        action='store',
+        default='warn',
+        choices=['warn', 'crit'],
+        required=False,
+        help='Threshold for failed snapshots',
+    )
+    # output options
+    output.add_argument(
+        '-d',
+        '--debug',
+        action='store_true',
+        default=False,
+        required=False,
+        help='Show debug output',
+    )
+
+    args = parser.parse_args()
+    return(args)
+
+
+# Setup Compute Object
+###############################################################################
+def setup_compute(args):
+    '''
+    Setup authenticated service. This will be used to make the api calls
+    '''
+    try:
+        creds = service_account.Credentials.from_service_account_info(
+            json.loads(args.jsonfile)
+        )
+        compute = build('compute', 'v1', credentials=creds)
+    except Exception as err:
+        send_unknown('Unable to authenticate '+str(err))
+    return(compute)
+
+
+# Get Instances
+###############################################################################
+def get_instance(args, compute):
+    '''
+    Retrieve instance object
+    '''
+    try:
+        instance = compute.instances().get(
+            project=args.project,
+            instance=args.instance,
+            zone=args.zone
+        ).execute()
+        logging.debug('INSTANCE OBJECT:\n'+pformat(instance))
+    except Exception as err:
+        send_unknown(str(err))
+        logging.debug(pformat(instance))
+    return(instance)
+
+
+# Get All the Disk IDs from the Instance
+###############################################################################
+def get_disks(args, compute, instance):
+    '''
+    Get all disk ids from the instance.  For each disk, get the resourcePolicy
+    if it exists, ignore if not since that means there is no schedule to
+    snapshot that disk.  Build a list of dictionaries that consists of a disk
+    id and its associated resourcePolicy.
+    '''
+    disks = []
+    for disk in instance['disks']:
+        tmp = {}
+        # Build source var instead of using diskName from instance.  This is
+        # because a diskName may not correlate to the actual url for the
+        # resource so can result in 404 not found ... thanks google
+        source = disk['source'].rsplit('/')[-1]
+        try:
+            d = compute.disks().get(
+                project=args.project,
+                disk=source,
+                zone=args.zone
+            ).execute()
+            logging.debug('DISK OBJECT:\n'+pformat(d))
+        except Exception as err:
+            send_unknown(str(err))
+        if d.get('resourcePolicies', None) is not None:
+            tmp['id'] = d['id']
+            tmp['name'] = d['name']
+            rplist = []
+            for rp in d['resourcePolicies']:
+                name = rp.rsplit('/')[-1]
+                rplist.append(name)
+            tmp['resourcePolicies'] = rplist
+            disks.append(tmp)
+    return(disks)
+
+
+# Get Schedule from Resource Policy
+###############################################################################
+def get_schedule(args, compute, disk):
+    '''
+    Get the schedule from the resource policies associated to each disk
+    '''
+    schedules = []
+    for rp in disk['resourcePolicies']:
+        try:
+            resource = compute.resourcePolicies().get(
+                project=args.project,
+                region=args.zone.rsplit('-', 1)[0],
+                resourcePolicy=rp
+            ).execute()
+            logging.debug('RESOURCE OBJECT:\n'+pformat(resource))
+        except Exception as err:
+            send_unknown(str(err))
+        schedule = resource['snapshotSchedulePolicy'].get('schedule', None)
+        if schedule is not None:
+            schedules.append(schedule)
+    return(schedules)
+
+
+# Get Zone Operations for Snapshot
+###############################################################################
+def get_zoneops(args, compute, disk, current_dt):
+    '''
+    Get the snapshot operations via the zoneops api for a given disk
+    '''
+    tz = timezone(timedelta(hours=0), name='UTC')
+    current_dt = current_dt.replace(tzinfo=tz)
+    td = current_dt - timedelta(minutes=args.lookback)
+    # td = current_dt - timedelta(days=2)
+    filter = '(operationType = createSnapshot) (targetId = '+disk['id']+')'
+    oplist = []
+    try:
+        # maxResults=1
+        operations = compute.zoneOperations().list(
+            project=args.project,
+            zone=args.zone,
+            filter=filter,
+        ).execute()
+        # Ensure operations are sorted by insertTime (time snapshot requested)
+        for op in operations['items']:
+            inserttime = parser.parse(
+                op['insertTime']).astimezone(timezone.utc)
+            if inserttime >= td:
+                oplist.append(op)
+        # ops = sorted(oplist, key = lambda i: i['insertTime'])
+        ops = sorted(oplist, key=lambda i: i['insertTime'])
+        logging.debug('ZONE OPS OBJECT:\n'+pformat(ops))
+        return(ops)
+    except Exception as err:
+        send_unknown(str(err))
+
+
+# Get snapshots
+###############################################################################
+def get_snapshots(args, compute, disk):
+    '''
+    Get all snapshots for this disk that were created by the schedule
+    '''
+    filter = '(sourceDiskId = '+disk['id']+') (autoCreated = True)'
+    try:
+        snap = compute.snapshots().list(
+            project=args.project,
+            filter=filter
+        ).execute()
+        snaps = sorted(snap['items'], key=lambda i: i['creationTimestamp'])
+        logging.debug('SNAPSHOT OBJECTS:\n'+pformat(snaps))
+        return(snaps)
+    except Exception as err:
+        if snap.get('items', None) == None:
+            send_unknown('No snapshots exist')
+        else:
+            send_unknown(str(err))
+
+
+# Check Schedule
+###############################################################################
+def check_weekly(args, disk_status, schedule, current_dt):
+    '''
+    For a given weekly snapshot schedule, check the defined schedule and look
+    for a snapshot created for this disk during that time window (1 hour)
+    Data is parsed and added to the global status variable
+    '''
+    # Helper tuple to get day of week index to use with datetime and timedelta
+    weekdays = (
+        'MONDAY',
+        'TUESDAY',
+        'WEDNESDAY',
+        'THURSDAY',
+        'FRIDAY',
+        'SATURDAY',
+        'SUNDAY'
+    )
+
+    # GCP uses GMT in places and local TZ in others so we will
+    # define a UTC tzinfo object to use when parsing time
+    tz = timezone(timedelta(hours=0), name='UTC')
+    current_dt = current_dt.replace(tzinfo=tz)
+
+    # Get last snapshot date/time and next snapshot date/time
+    for d in schedule['weeklySchedule']['dayOfWeeks']:
+        # Find the day (int) from the tuple
+        day = weekdays.index(d['day'])
+        hour = int(d['startTime'].split(':')[0])
+        minute = int(d['startTime'].split(':')[1])
+        daysuntilsnap = day - current_dt.weekday()
+        # Parse duration in seconds
+        duration = isodate.parse_duration(
+            d['duration']
+        ).seconds
+        nextsnapday = current_dt + timedelta(days=daysuntilsnap)
+        lastsnapday = nextsnapday - timedelta(weeks=1)
+        lastsnapdt = lastsnapday.replace(
+            hour=hour,
+            minute=minute,
+            second=0,
+            microsecond=0,
+            tzinfo=tz
+        )
+        lastsnapdtend = lastsnapdt + timedelta(seconds=duration)
+        nextsnapdt = nextsnapday.replace(
+            hour=hour,
+            minute=minute,
+            second=0,
+            microsecond=0,
+            tzinfo=tz
+        )
+        disk_status['nextsnap'] = nextsnapdt
+        # One last adjustment based on current time and duration
+        # TODO not efficient, review/improve
+        if lastsnapdtend > current_dt:
+            lastsnapday = lastsnapday - timedelta(weeks=1)
+            lastsnapdtend = lastsnapdtend - timedelta(weeks=1)
+            nextsnapdt = nextsnapdt - timedelta(weeks=1)
+        for snapshot in disk_status['allsnaps']:
+            createtime = parser.parse(
+                snapshot['creationTimestamp']
+            ).astimezone(timezone.utc)
+            if lastsnapdt <= createtime <= lastsnapdtend:
+                disk_status['lastsnap'] = {
+                    'name': snapshot['name'],
+                    'status': snapshot['status'],
+                    'createtime': createtime
+                }
+    logging.debug('WEEKLY DISK STATUS:\n'+pformat(disk_status))
+    return(disk_status)
+
+
+# Check Daily Schedule
+###############################################################################
+def check_daily(args, disk_status, schedule, current_dt):
+    '''
+    For a given daily snapshot schedule, check the defined schedule and look
+    for a snapshot created for this disk during that time window (1 hour)
+    Data is parsed and added to the global status variable
+    '''
+    # GCP uses GMT in places and local TZ in others so we will
+    # define a UTC tzinfo object to use when parsing time
+    tz = timezone(timedelta(hours=0), name='UTC')
+    current_dt = current_dt.replace(tzinfo=tz)
+    starthour = int(schedule['dailySchedule']['startTime'].split(':')[0])
+    startminute = int(schedule['dailySchedule']['startTime'].split(':')[1])
+    # Parse duration in seconds
+    duration = isodate.parse_duration(
+        schedule['dailySchedule']['duration']
+    ).seconds
+    # Determin initial last and next snapshot timeframes
+    if current_dt.hour >= starthour:
+        lastsnap = current_dt.replace(
+            hour=starthour,
+            minute=startminute,
+            second=0,
+            tzinfo=tz
+        )
+        nextsnap = current_dt.replace(
+            hour=starthour,
+            minute=startminute,
+            second=0,
+            tzinfo=tz
+        ) + timedelta(days=1)
+    else:
+        lastsnap = current_dt.replace(
+            hour=starthour,
+            minute=startminute,
+            second=0,
+            tzinfo=tz
+        ) - timedelta(days=1)
+        nextsnap = current_dt.replace(
+            hour=starthour,
+            minute=startminute,
+            second=0,
+            tzinfo=tz
+        )
+    lastsnapend = lastsnap + timedelta(seconds=duration)
+    # One last adjustment based on current time and duration
+    # TODO not efficient, review/improve
+    if lastsnapend > current_dt:
+        lastsnap = lastsnap - timedelta(days=1)
+        lastsnapend = lastsnapend - timedelta(days=1)
+        nextsnap = nextsnap - timedelta(days=1)
+    for snapshot in disk_status['allsnaps']:
+        createtime = parser.parse(
+            snapshot['creationTimestamp']
+        ).astimezone(timezone.utc)
+        if lastsnap <= createtime <= lastsnapend:
+            disk_status['lastsnap'] = {
+                'name': snapshot['name'],
+                'status': snapshot['status'],
+                'createtime': createtime
+            }
+            disk_status['nextsnap'] = nextsnap
+    logging.debug('DAILY DISK STATUS:\n'+pformat(disk_status))
+    return(disk_status)
+
+
+# Check Hourly Schedule
+###############################################################################
+def check_hourly(args, disk_status, schedule, current_dt):
+    '''
+    For a given hourly snapshot schedule, check the defined schedule and look
+    for a snapshot created for this disk during that time window (1 hour).
+    Data is parsed and added to the global status variable
+    '''
+    # GCP uses GMT in places and local TZ in others so we will
+    # define a UTC tzinfo object to use when parsing time
+    tz = timezone(timedelta(hours=0), name='UTC')
+
+    # hours in between snapshots
+    interval = int(schedule['hourlySchedule']['hoursInCycle'])
+    starthour = int(schedule['hourlySchedule']['startTime'].split(':')[0])
+    startminute = int(schedule['hourlySchedule']['startTime'].split(':')[1])
+
+    # Parse duration in seconds
+    duration = isodate.parse_duration(
+        schedule['hourlySchedule']['duration']
+    ).seconds
+    # GCP documentation says the starttime will always have a 00 value for
+    # minutes, but I parse and include it here just in case they change their
+    # mind in the future
+    starttime = current_dt.replace(
+        hour=starthour, minute=startminute, second=0)
+    current_dt = current_dt.replace(tzinfo=tz)
+
+    # ugly hack to find the last and next interval, based on start time and
+    # hours between snapshots
+    for dt in (starttime + timedelta(hours=interval*i) for i in range(24//interval)):
+        dt = dt.replace(tzinfo=tz)
+        nexthour = dt+timedelta(hours=interval)
+        nexthour = nexthour.replace(tzinfo=tz)
+        lastsnapend = dt+timedelta(seconds=duration)
+
+        # If past duration window, snap should have completed, check
+        # for a snapshot created in between the start time and duration
+        if lastsnapend.hour <= current_dt.hour <= nexthour.hour:
+            for snapshot in disk_status['allsnaps']:
+                createtime = parser.parse(
+                    snapshot['creationTimestamp']
+                ).astimezone(timezone.utc)
+                if dt <= createtime <= lastsnapend:
+                    disk_status['lastsnap'] = {
+                        'name': snapshot['name'],
+                        'status': snapshot['status'],
+                        'createtime': createtime
+                    }
+                    disk_status['nextsnap'] = nexthour
+
+            # Found what we need, bail out and move on
+            break
+    logging.debug('HOURLY DISK STATUS:\n'+pformat(disk_status))
+    return(disk_status)
+
+
+# Analyze Results
+##############################################################################
+def analyze_results(args, current_dt):
+    '''
+    At this point we have parsed all schedules, snapshots and zone operations
+    for each disk on a given instance, and combined them into one big dict.
+    We can now check this dict and ascertain the overall status of snapshots
+    for this instance.
+    '''
+    tz = timezone(timedelta(hours=0), name='UTC')
+    current_dt = current_dt.replace(tzinfo=tz)
+    message = ''
+    missing = 0
+    failedsnaps = []
+    totalsnaps = 0
+    zoneopserrors = []
+    zoneopswarnings = []
+    alerts = [ok]
+    logging.debug('OVERALL STATUS:\n'+pformat(status))
+    for disk in status:
+        totalsnaps += len(disk['allsnaps'])
+        # Was the last snapshot created?
+        # disk['lastsnap']['status'] = 'FAILED' # Test Data
+        # del disk['lastsnap'] # Test Data
+        if disk.get('lastsnap', None) is None:
+            missing += 1
+            if args.missinglevel == 'crit':
+                alerts.append(crit)
+            elif args.missinglevel == 'warn':
+                alerts.append(warn)
+        # Did the last snapshot fail?
+        elif disk.get('lastsnap', None).get('status', None) == 'FAILED':
+            failedsnaps.append(disk['lastsnap']['name'])
+            if args.failedlevel == 'crit':
+                alerts.append(crit)
+            elif args.failedlevel == 'warn':
+                alerts.append(warn)
+
+        # Are there any existing snaps that failed?
+        for snap in disk['allsnaps']:
+            # snap['status'] = 'FAILED' # Test Data
+            if snap['status'] == 'FAILED':
+                failedsnaps.append(snap['name'])
+                if args.failedlevel == 'crit':
+                    alerts.append(crit)
+                elif args.failedlevel == 'warn':
+                    alerts.append(warn)
+
+        # Are there any failed zone operations?
+        for op in disk['zoneops']:
+            if op.get('status', None) == 'DONE':
+                # op['error'] = {'errors': ['shit happened', 'more shit']} # Test Data
+                if op.get('error', None) is not None:
+                    for ze in op['error']['errors']:
+                        zoneopserrors.append(ze)
+                        # zoneopserrors.append(op['error']['errors'])
+                    if args.failedlevel == 'crit':
+                        alerts.append(crit)
+                    elif args.failedlevel == 'warn':
+                        alerts.append(warn)
+                # op['warnings'] = [{'code': 'stuff'}] # Test Data
+                if op.get('warnings', None) is not None:
+                    zoneopswarnings.append(op['warnings'])
+                    if args.failedlevel == 'crit':
+                        alerts.append(crit)
+                    elif args.failedlevel == 'warn':
+                        alerts.append(warn)
+    # Build status message
+    if len(zoneopserrors) > 0:
+        message += '{} Errors found during scheduled snapshot creation. '.format(
+            str(len(zoneopserrors))
+        )
+    if len(zoneopswarnings) > 0:
+        message += '{} Warnings found during scheduled snapshot creation. '.format(
+            str(len(zoneopswarnings))
+        )
+    if len(failedsnaps) > 0:
+        for fs in failedsnaps:
+            message += 'Snapshot {} Failed. '.format(fs)
+    if missing > 0:
+        message += 'A scheduled snapshot is missing'
+    if (len(failedsnaps) == 0 and
+        missing == 0 and
+        len(zoneopserrors) == 0 and
+            len(zoneopswarnings) == 0):
+        message += 'All scheduled snapshots are present and ready'
+
+    # Add perf data
+    message += ' | '
+    message += 'total_snapshots={} '.format(str(totalsnaps))
+    message += 'missing_snapshots={} '.format(str(missing))
+    message += 'failed_snapshots={} '.format(str(len(failedsnaps)))
+    message += 'operation_errors={} '.format(str(len(zoneopserrors)))
+    message += 'operation_warnings={} '.format(str(len(zoneopswarnings)))
+
+    # Determine alert level and send alert
+    alertlevel = max(alerts)
+    if alertlevel == crit:
+        send_critical(message)
+    elif alertlevel == warn:
+        send_warning(message)
+    elif alertlevel == ok:
+        send_ok(message)
+
+
+# Main
+###############################################################################
+def main():
+    '''Hold muh beer'''
+    args = get_args()
+    # Enable debug messages if debug arg exists
+    if args.debug:
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format='[%(levelname)-8s] %(message)s'
+        )
+    compute = setup_compute(args)
+    instance = get_instance(args, compute)
+    disks = get_disks(args, compute, instance)
+    current_dt = datetime.utcnow()
+
+    # Get all schedules and snapshot operations for each disk
+    for disk in disks:
+        # We will pass this var to appropriate functions so we can organize
+        # status per disk which will ultimately be appended to the global
+        # "status" variable
+        disk_status = {'disk_name': disk['name']}
+        schedules = get_schedule(args, compute, disk)
+        disk_status['zoneops'] = get_zoneops(args, compute, disk, current_dt)
+        disk_status['allsnaps'] = get_snapshots(args, compute, disk)
+        for schedule in schedules:
+            if schedule.get('weeklySchedule', None):
+                disk_status = check_weekly(
+                    args,
+                    disk_status,
+                    schedule,
+                    current_dt
+                )
+            if schedule.get('dailySchedule', None):
+                disk_status = check_daily(
+                    args,
+                    disk_status,
+                    schedule,
+                    current_dt
+                )
+            if schedule.get('hourlySchedule', None):
+                disk_status = check_hourly(
+                    args,
+                    disk_status,
+                    schedule,
+                    current_dt
+                )
+            status.append(disk_status)
+
+    # Analyze the overall results
+    analyze_results(args, current_dt)
+
+
+if __name__ == '__main__':
+    main()

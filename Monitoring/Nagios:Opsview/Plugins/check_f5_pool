@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+######################################################################
+# Description:		Nagios/Opsview plugin to check the status of
+#			F5 Pool availability by individual poolname
+#
+# Author:		Bo Smith (bo@bosmith.tech)
+# Creation Date:	2017-12-28
+# Dependencies:		python-netsnmp, python-getopt, POWERNET mib,
+######################################################################
+import netsnmp
+import sys
+import pprint
+import re
+import os
+import argparse
+
+# Nagios Variables
+STATE_OK = 0
+STATE_WARNING = 1
+STATE_CRITICAL = 2
+STATE_UNKNOWN = 3
+
+# Parse arguments
+#####################################################################
+parser = argparse.ArgumentParser(
+    prog='check_f5_pool',
+    description='Plugin for monitoring the status of individual F5 Pools')
+parser.add_argument('-H', '--host', action='store',
+                    help='Hostname or IP address of the network device', required=True)
+parser.add_argument('-v', '--version', action='store',
+                    help='SNMP Version', required=True)
+parser.add_argument('-C', '--community', action='store',
+                    help='SNMP v2 Community String')
+parser.add_argument('-a', '--authproto', action='store',
+                    help='SNMP v3 Auth Protocol')
+parser.add_argument('-A', '--authkey', action='store',
+                    help='SNMP v3 Auth Key')
+parser.add_argument('-p', '--privproto', action='store',
+                    help='SNMP v3 Priv Protocol')
+parser.add_argument('-P', '--privkey', action='store',
+                    help='SNMP v3 Priv Key')
+parser.add_argument('-u', '--secuser', action='store',
+                    help='SNMP v3 Security User')
+parser.add_argument('-w', '--warning', action='store_true', default=False,
+                    help='Alert as a WARNING')
+parser.add_argument('-c', '--critical', action='store_true', default=True,
+                    help='Alert as a CRITICAL')
+parser.add_argument('-n', '--name', action='store', required=True,
+                    help='Pool name to check')
+
+args = parser.parse_args()
+DestHost = args.host
+Version = args.version
+Community = args.community
+SecLevel = 'authPriv'
+AuthProto = args.authproto.upper()
+AuthPass = args.authkey
+PrivProto = args.privproto.upper()
+PrivPass = args.privkey
+SecName = args.secuser
+warning = args.warning
+critical = args.critical
+poolname = args.name
+
+# Check that all the arguments make sense
+if DestHost == '':
+    print("Error: Host is required, see -h or --help for assistance")
+    sys.exit(3)
+if Version == '':
+    print("Error: Version is required, see -h or --help for assistance")
+    sys.exit(3)
+if (Version == '2') or (Version == '2c'):
+    if Version == '2c':
+        Version = '2'
+    if Community == '':
+        print(
+            "Error: Version 2 requires a community string, see -h or --help for assistance")
+        sys.exit(3)
+    else:
+        session = netsnmp.Session(
+            DestHost=DestHost, Version=int(Version), Community=Community)
+
+if Version == '3':
+    if DestHost == None or AuthProto == None or AuthPass == None or PrivProto == None or PrivPass == None or SecName == None:
+        print("Error: Version 3 requires AuthProto, AuthPass, PrivProto, PrivPass and SecName\nSee -h or --help for assistance")
+        sys.exit(3)
+    else:
+        session = netsnmp.Session(DestHost=DestHost, Version=int(Version), SecLevel=SecLevel,
+                                  AuthProto=AuthProto, AuthPass=AuthPass, PrivProto=PrivProto, PrivPass=PrivPass, SecName=SecName)
+
+# Get the status of the LB
+#####################################################################
+# Test connect and poll
+Descr = session.get(netsnmp.VarList(netsnmp.Varbind("SNMPv2-MIB::sysDescr.0")))
+if Descr[0].decode() == None:
+    print('Unable to connect to host')
+    sys.exit(3)
+poolnames = session.walk(netsnmp.VarList(
+    netsnmp.Varbind(".1.3.6.1.4.1.3375.2.2.5.5.2.1.1")))
+poolavailstate = session.walk(netsnmp.VarList(
+    netsnmp.Varbind(".1.3.6.1.4.1.3375.2.2.5.5.2.1.2")))
+#poolenablestate = session.walk(netsnmp.VarList(netsnmp.Varbind(".1.3.6.1.4.1.3375.2.2.5.5.2.1.3")))
+pooldetails = session.walk(netsnmp.VarList(
+    netsnmp.Varbind(".1.3.6.1.4.1.3375.2.2.5.5.2.1.5")))
+pool = {}
+for i in range(len(poolnames)):
+    if poolnames[i].decode() == poolname:
+        pool['name'] = poolnames[i].decode()
+        pool['availstate'] = poolavailstate[i].decode()
+        #pool['enablestate'] = poolenablestate[i]
+        pool['details'] = pooldetails[i].decode()
+
+# Parse the results and return to Opsview
+#####################################################################
+if pool == {}:
+    print('UNKNOWN: Unable to obtain status of '+poolname)
+    sys.exit(STATE_UNKNOWN)
+elif pool['availstate'] == '1':
+    print('OK: '+poolname+' is available: ')
+    sys.exit(STATE_OK)
+elif pool['availstate'] != '1':
+    if warning == True:
+        print('WARNING: '+poolname+' is unavailable: '+str(pool['details']))
+        sys.exit(STATE_WARNING)
+    else:
+        print('CRITICAL: '+poolname+' is unavailable: '+str(pool['details']))
+        sys.exit(STATE_CRITICAL)
+else:
+    print('UNKNOWN: unable to to obtain status of ' +
+          poolname+' does the pool exist?')
+    sys.exit(STATE_UNKNOWN)

@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+##############################################################################
+'''
+Description:	Opsview/Nagios plugin used to monitor linux memory via ssh
+                Modeled after the Nagios plugin check_memory
+Requirements:	Requires a username/password or username/ssh key
+Created:	    2019-05-17
+Author:		    Bo Smith (bo@bosmith.tech)
+'''
+##############################################################################
+import argparse
+import io
+import paramiko
+import sys
+
+ok = 0
+warn = 1
+crit = 2
+unknown = 3
+cmd = 'cat /proc/meminfo'
+# Dictionary of metrics tracked and if they are required
+metrics_req = {
+    'MemTotal' : True,
+    'MemFree' : True, 
+    'Inactive' : True, 
+    'Buffers' : True, 
+    'Cached' : True,
+    'SReclaimable' : False, 
+    'SwapCached' : True, 
+    'SwapFree' : True, 
+    'SwapTotal' : True}
+
+
+# Get arguments
+##############################################################################
+def get_args():
+    parser = argparse.ArgumentParser(
+        usage='%(prog)s [-H] [-u] [-p]',
+        description='Opsview plugin to remotely monitor Linux Memory via SSH')
+    parser.add_argument(
+        '-H',
+        '--host',
+        action='store',
+        required=True,
+        help='Host name or IP address'
+    )
+    parser.add_argument(
+        '-s',
+        '--sshkey',
+        action='store',
+        default='',
+        required=False,
+        help='SSH Key'
+    )
+    parser.add_argument(
+        '-ss',
+        '--sshkeystring',
+        action='store',
+        default='',
+        required=False,
+        help='SSH Key as String'
+    )
+    parser.add_argument(
+        '-u',
+        '--username',
+        action='store',
+        default='',
+        required=False,
+        help='Username to SSH to the appliance (Assumed \'opsview\' if blank'
+    )
+    parser.add_argument(
+        '-p',
+        '--password',
+        action='store',
+        default='',
+        required=False,
+        help='Password for the user'
+    )
+    parser.add_argument(
+        '-P',
+        '--port',
+        action='store',
+        required=False,
+        default=22,
+        type=int,
+        help='SSH Port to use (Default 22)'
+    )
+    parser.add_argument(
+        '-t',
+        '--timeout',
+        action='store',
+        required=False,
+        default=15,
+        type=int,
+        help='Timeout in Seconds to wait for an SSH connection (default 15)'
+    )
+    parser.add_argument(
+        '-w',
+        '--warning',
+        action='store',
+        required=False,
+        type=float,
+        help='Warning threshold in percentage'
+    )
+    parser.add_argument(
+        '-c',
+        '--critical',
+        action='store',
+        required=False,
+        type=float,
+        help='Critical threshold in percentage'
+    )
+    args = parser.parse_args()
+    if (args.username == None and args.sshkey == None):
+        print("Either a username and password combination or ssh key is required")
+        print(parser.print_help())
+        sys.exit(unknown)
+    return(args)
+
+
+# Setup and create Paramiko connection object
+##############################################################################
+def setup_ssh(args):
+    try:
+        # Prep client
+        client = paramiko.SSHClient()
+        client.load_system_host_keys()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        # Build kwargs used to setup ssh connection
+        clientargs = {
+            'banner_timeout': args.timeout,
+            'timeout': args.timeout,
+            'password': args.password,
+            'port': args.port,
+            'username': args.username
+        }
+        # Add ssh key from file if provided as file path
+        if args.sshkey:
+            clientargs['key_filename'] = args.sshkey
+        # Add ssh key from string if provided as string
+        elif args.sshkeystring:
+            s = io.StringIO(args.sshkeystring.replace('\\n', '\n'))
+            opsvkey = paramiko.RSAKey.from_private_key(
+                s,
+                password=args.password
+            )
+            clientargs['pkey'] = opsvkey
+        # Setup Connection
+        client.connect(args.host, **clientargs)
+    except paramiko.AuthenticationException as err:
+        message = 'Authentication failed '+str(err)
+        send_unknown(message)
+    except paramiko.SSHException as err:
+        message = 'Unable to establish SSH connection '+str(err)
+        send_unknown(message)
+    except IOError as err:
+        message = 'Timed Out attempting SSH connection'
+        send_unknown(message)
+    except Exception as err:
+        message = 'Unable to establish SSH connection '+str(err)
+        send_unknown(message)
+    return(client)
+
+
+# Gather the Metrics
+##############################################################################
+def get_memory(client, cmd, metrics_req):
+    results = {}
+    try:
+        stdin, stdout, stderr = client.exec_command(cmd, get_pty=True)
+    except Exception as err:
+        send_unknown(str(err))
+    tmp = stdout.readlines()
+    # CA-594: Add logic to strip first output line if it's "/usr/bin/id: cannot find name for group ID"
+    # This is to handle unpredictable addition of extra output for OSLogin hosts in GCP
+    if 'id: cannot find name' in tmp[0]:
+        del tmp[0]
+
+    # Strip trailing characters
+    for line in tmp:
+        if line.split(':')[0] in metrics_req.keys():
+            key = line.split(":")[0]
+            value = line.split(":")[1].strip()
+            value = value.split(" ")[0]
+            # Let's convert to MB
+            results[key] = round(float(value) / 1024)
+    # Warn if required metric is missing from results
+    # Zero out unrequired metrics not returned in results
+    for metric, required in metrics_req.items():
+        if required == True:
+            if metric not in results.keys():
+                message = 'Required metric "' + metric + '" not found in meminfo results'
+                send_warning(message)
+        elif required == False:
+            if metric not in results.keys():
+                results[metric] = 0
+    return(results)
+
+
+# Process Stats
+##############################################################################
+def process_stats(stats, args):
+    # Calculate used amount
+    used = stats['MemTotal'] - (stats['Cached'] +
+                                stats['Buffers'] +
+                                stats['MemFree'] +
+                                stats['SReclaimable'])
+    # Calculate used percent
+    usedpct = round(100 - (100 / stats['MemTotal']) * (stats['Cached'] +
+                                                       stats['Buffers'] +
+                                                       stats['MemFree'] +
+                                                       stats['SReclaimable']))
+    # Calculate used swap if swap exists
+    if stats['SwapTotal'] > 0:
+        swapused = stats['SwapTotal'] - stats['SwapFree']
+        swapusedpct = (100 - ((100/stats['SwapTotal'])*stats['SwapFree']))
+    else:
+        swapused = 0
+        swapusedpct = 0
+    message = 'Usage: real {}% ({}/{} MB),'.format(usedpct,
+                                                   used, stats['MemTotal'])
+    message += ' buffer: {} MB,'.format(stats['Buffers'])
+    message += ' cache: {} MB,'.format(stats['Cached'])
+    message += ' swap: {}% ({}/{} MB)'.format(swapusedpct,
+                                              swapused, stats['SwapTotal'])
+    message += ' | total={} used={} buffers={} cached={}'.format(
+        stats['MemTotal'], used, stats['Buffers'], stats['Cached'])
+    # If we want both Critical and Warning alerts
+    if args.critical and args.warning:
+        if usedpct >= args.critical:
+            send_critical(message)
+        elif usedpct >= args.warning:
+            send_warning(message)
+        else:
+            send_ok(message)
+    # If we just want critical alerts
+    elif args.critical:
+        if usedpct >= args.critical:
+            send_critical(message)
+        else:
+            send_ok(message)
+    # If we just want warning alerts
+    elif args.warning:
+        if usedpct >= args.warning:
+            send_warning(message)
+        else:
+            send_ok(message)
+    # If we only want to gather the metrics and not alert
+    else:
+        send_ok(message)
+
+
+# Alert Functions
+##############################################################################
+def send_warning(message):
+    print('WARNING - '+message)
+    sys.exit(warn)
+
+
+def send_critical(message):
+    print('CRITICAL - '+message)
+    sys.exit(crit)
+
+
+def send_ok(message):
+    print('OK - '+message)
+    sys.exit(ok)
+
+
+def send_unknown(message):
+    print('UNKNOWN - '+message)
+    sys.exit(unknown)
+
+
+# Git-r-done!
+##############################################################################
+def main():
+    args = get_args()
+    client = setup_ssh(args)
+    stats = get_memory(client, cmd, metrics_req)
+    client.close()
+    process_stats(stats, args)
+
+
+if __name__ == "__main__":
+    main()

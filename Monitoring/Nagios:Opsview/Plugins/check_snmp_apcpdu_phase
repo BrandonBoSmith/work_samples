@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+######################################################################
+# Description:		Nagios/Opsview plugin to check phase voltage
+#			probes from an APC PDU
+#
+#
+# Author:		Bo Smith (bo@bosmith.tech)
+# Creation Date:	2017-09-22
+# Dependencies:	python-netsnmp, python-getopt, POWERNET mib
+######################################################################
+import netsnmp
+import getopt
+import sys
+import re
+
+# Example for testing
+######################################################################
+
+# SNMP Variables
+DestHost = ''
+Version = ''
+Community = ''
+SecLevel = 'authPriv'
+AuthProto = ''
+AuthPass = ''
+PrivProto = ''
+PrivPass = ''
+SecName = ''
+
+# Nagios Variables
+STATE_OK = 0
+STATE_WARNING = 1
+STATE_CRITICAL = 2
+STATE_UNKNOWN = 3
+
+# Check Veriables
+current = ''
+temp = {}
+warn = 0
+crit = 0
+warn_low = 0
+warn_high = 0
+crit_low = 0
+crit_high = 0
+warning = False
+critical = False
+status_string = ''
+perf_string = ' | '
+
+# Get name of spreadsheet to process appointments for
+#####################################################################
+helpfile = """Usage: check_snmp_apcpdu_temp -H [host] -v [snmp protocol] [options]
+Example: check_snmp_apcpdu_temp -H 10.140.0.8 -v 3 -l authPriv -a MD5 -A authkey -x AES -X authkey -u SNMPUser
+    -H, --host		Hostname or IP address of the network device.
+
+    -v, --version	SNMP version.
+
+    -C, --community	SNMP community string, if using SNMP version 1 or 2.
+
+    -a, --authproto	SNMP v3 authentication protocol. MD5 or SHA.
+
+    -A, --authkey	SNMP v3 authentication key string.
+
+    -x, --privproto	SNMP v3 privacy protocol.  DES, AES, AES128.
+
+    -X, --privkey	SNMP v3 privacy key string.
+
+    -u, --secuser	SNMP v3 security username.
+
+    -w, --warning	Warning threshold
+
+    -c, --critical	Critical threshold
+
+    -h, --help          This help file."""
+
+if len(sys.argv) > 1:
+    a = sys.argv[1:]
+else:
+    print(helpfile)
+    sys.exit()
+
+# Parse arguments
+#####################################################################
+try:
+    opts, args = getopt.getopt(a, "hH:v:C:a:A:x:X:u:w:c:", [
+                               "help", "host=", "version=", "community=", "authproto=", "authkey=", "privproto=", "privkey=", "secuser=", "warning=", "critical="])
+except getopt.GetoptError:
+    print(helpfile)
+    sys.exit(3)
+
+# Assign argments to variables
+for opt, arg in opts:
+    if opt in ("-h", "--help"):
+        print(helpfile)
+        sys.exit()
+    elif opt in ("-H", "--host"):
+        DestHost = arg
+    elif opt in ("-v", "--version"):
+        Version = arg
+    elif opt in ("-C", "--community"):
+        Community = arg
+    elif opt in ("-l", "--seclevel"):
+        SecLevel = arg
+    elif opt in ("-a", "--authproto"):
+        AuthProto = arg.upper()
+    elif opt in ("-A", "--authkey"):
+        AuthPass = arg
+    elif opt in ("-x", "--privproto"):
+        PrivProto = arg.upper()
+    elif opt in ("-X", "--privpass"):
+        PrivPass = arg
+    elif opt in ("-u", "--secuser"):
+        SecName = arg
+    elif opt in ("-w", "--warning"):
+        warn = arg
+    elif opt in ("-c", "--critical"):
+        crit = arg
+
+# Check that all the arguments make sense
+if DestHost == '':
+    print("Error: Host is required, see -h or --help for assistance")
+    sys.exit(3)
+if Version == '':
+    print("Error: Version is required, see -h or --help for assistance")
+    sys.exit(3)
+if (Version == '2') or (Version == '2c'):
+    if Version == '2c':
+        Version = '2'
+    if Community == '':
+        print(
+            "Error: Version 2 requires a community string, see -h or --help for assistance")
+        sys.exit(3)
+    else:
+        session = netsnmp.Session(
+            DestHost=DestHost, Version=int(Version), Community=Community)
+if Version == '3':
+    if DestHost == '' or AuthProto == '' or AuthPass == '' or PrivProto == '' or PrivPass == '' or SecName == '':
+        print("Error: Version 3 requires AuthProto, AuthPass, PrivProto, PrivPass and SecName\nSee -h or --help for assistance")
+        sys.exit(3)
+    else:
+        session = netsnmp.Session(DestHost=DestHost, Version=int(Version), SecLevel=SecLevel,
+                                  AuthProto=AuthProto, AuthPass=AuthPass, PrivProto=PrivProto, PrivPass=PrivPass, SecName=SecName)
+if (crit == '') and (warn == ''):
+    print('Error: a Warning or Critical threshold must be supplied')
+    print(helpfile)
+    sys.exit(3)
+
+# Perform SNMP call/s
+#####################################################################
+count = 0
+for i in session.walk(netsnmp.VarList(netsnmp.Varbind("PowerNet-MIB::rPDU2PhaseStatusIndex"))):
+    try:
+        t = i.decode()
+        pdu = session.get(netsnmp.VarList(netsnmp.Varbind(
+            "PowerNet-MIB::rPDU2PhaseStatusModule", t)))
+        pdu = pdu[0].decode()
+        phase = session.get(netsnmp.VarList(netsnmp.Varbind(
+            "PowerNet-MIB::rPDU2PhaseStatusNumber", t)))
+        phase = phase[0].decode()
+        current = session.get(netsnmp.VarList(netsnmp.Varbind(
+            "PowerNet-MIB::rPDU2PhaseStatusCurrent", t)))
+        current = int(current[0].decode()) * .1
+    except Exception as err:
+        print('WARNING - '+str(err))
+        sys.exit(STATE_WARNING)
+
+
+# Evaluate results
+#####################################################################
+# for sensor in temp:
+    # If Critical threshold is a range
+    if (crit != 0) and (current >= int(crit)):
+        # If critical threshold is set, evaluate
+        critical = True
+
+    # If Warning threshold is a range
+    if (warn != 0) and (current >= int(warn)):
+        # If critical threshold is set, evaluate
+        warning = True
+
+    status_string = status_string+' pdu'+pdu+'_phase_l'+phase+': '+str(current)
+    if count > 0:
+        perf_string = perf_string+' pdu'+pdu+'_phase_l'+phase+'='+str(current)
+    else:
+        perf_string = perf_string+'pdu'+pdu+'_phase_l'+phase+'='+str(current)
+    count += 1
+
+if critical == True:
+    print('CRITICAL:'+status_string+perf_string)
+    sys.exit(STATE_CRITICAL)
+elif warning == True:
+    print('WARNING:'+status_string+perf_string)
+    sys.exit(STATE_WARNING)
+elif current == '':
+    print('UNKOWN: Unable to get current')
+    sys.exit(STATE_UNKNOWN)
+else:
+    print('OK:'+status_string+perf_string)
+    sys.exit(STATE_OK)

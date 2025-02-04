@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+'''
+Description:    Opsview monitoring plugin that checks that status of Tableau 
+                using the systeminfo.xml http endpoint.  Plugin is based on
+                https://help.tableau.com/current/server/en-us/service_status_xml.htm
+Author:         Bo Smith (bo@bosmith.tech)
+Date:           2020-10-27
+'''
+
+import argparse
+import logging
+import nagiosplugin
+import requests
+import pprint
+import sys
+import xml.etree.ElementTree as ET
+
+# Global vars
+tabOk = ['Active', 'ActiveSyncing', 'Busy', 'Passive']
+tabNotok = [
+    'Down',
+    'ReadOnly',
+    'StatusNotAvailable',
+    'StatusNotAvailableSyncing',
+    'NotAvailable',
+    'DecommisionedReadOnly',
+    'DecomisioningReadOnly',
+    'DecommissionFailedReadOnly'
+]
+perfData = {
+    'active': 0,
+    'busy': 0,
+    'passive': 0,
+    'unlicensed': 0,
+    'down': 0,
+    'unavailable': 0,
+    'readonly': 0,
+    'activesyncing': 0,
+    'statusnotavailable': 0,
+    'statusnotavailablesyncing': 0,
+    'notavailable': 0,
+    'decommissionedreadonly': 0,
+    'decommissioningreadonly': 0,
+    'decommissionfailedreadonly': 0
+}
+
+ok = 0
+warn = 1
+crit = 2
+unknown = 3
+
+# Get arguments
+###############################################################################
+
+
+def get_args():
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="Opsview plugin to monitor the status of Tableau"
+    )
+    tableau = parser.add_argument_group('Tableau Options (required)')
+    tableau.add_argument(
+        '-H',
+        '--host',
+        action='store',
+        required=True,
+        help='Hostname/DNS Name or IP address of the Tableau server'
+    )
+    tableau.add_argument(
+        '-m',
+        '--mode',
+        action='store',
+        required=True,
+        help='Mode of check to run'
+    )
+    tableau.add_argument(
+        '-s',
+        '--ssl',
+        action='store_true',
+        default=False,
+        required=False,
+        help='Use https when checking status'
+    )
+    tableau.add_argument(
+        '-w',
+        '--worker',
+        action='store',
+        required=False,
+        help='Worker name to filter on'
+    )
+    tableau.add_argument(
+        '--insecure',
+        action='store_true',
+        default=False,
+        required=False,
+        help='Use this argument to disable SSL certificate verification'
+    )
+    parser.add_argument(
+        '-W',
+        '--warning',
+        action='store_true',
+        default=False,
+        required=False,
+        help='Alert level WARNING'
+    )
+    parser.add_argument(
+        '-C',
+        '--critical',
+        action='store_true',
+        default=False,
+        required=False,
+        help='Alert level CRITICAL'
+    )
+    parser.add_argument(
+        '--logLevel',
+        action='store',
+        choices=[
+            'critical',
+            'error',
+            'warning',
+            'info',
+            'debug',
+            'notset',
+        ],
+        required=False,
+        default='INFO',
+        help="Desired log level"
+    )
+    parser.add_argument(
+        '-t',
+        '--timeout',
+        action='store',
+        default=60,
+        type=int,
+        required=False,
+        help='Timeout in seconds (default is 60)'
+    )
+    return(parser.parse_args())
+
+
+# Get Tableau xml dom
+###############################################################################
+def get_dom(args, url, session):
+    # Make HTTP/S request and handle various different exceptions so we can
+    # provide more helpful feedback
+    try:
+        s = session.get(
+            url,
+            timeout=args.timeout
+        )
+        s.raise_for_status()
+    except requests.exceptions.HTTPError as err:
+        send_warning(str(err))
+    except requests.exceptions.SSLError as err:
+        send_warning(
+            'SSLError: certificate verify failed. Consider --insecure'
+        )
+        logging.debug(str(err))
+    except requests.exceptions.ConnectionError as err:
+        if args.mode == 'service':
+            send_critical('Connection refused')
+        else:
+            send_unknown('Connection refused')
+        logging.debug(str(err))
+    except requests.exceptions.Timeout as err:
+        if args.mode == 'service':
+            send_critical('Connection timed out after {} seconds'.format(
+                str(args.timeout)
+            ))
+        else:
+            send_unknown('Connection timed out after {} seconds'.format(
+                str(args.timeout)
+            ))
+        logging.debug(str(err))
+    except Exception as err:
+        send_warning(str(err))
+
+    # Parse the data returned and get the top XML DOM
+    try:
+        dom = ET.fromstring(s.text)
+        logging.debug('XML DOM: '+pprint.pformat(s.text))
+        return(dom)
+    except ET.ParseError as err:
+        send_warning(str(err))
+    except Exception as err:
+        send_warning(str(err))
+
+
+# Mode: Service
+###############################################################################
+def check_service(args, dom):
+    try:
+        service = dom.find('./service')
+        status = service.get('status')
+        logging.debug('SERVICE STATUS: '+pprint.pformat(status))
+    except ET.ParseError as err:
+        send_unknown(str(err))
+    except Exception as err:
+        send_unknown(str(err))
+
+    message = 'Service is {}'.format(status)
+    if any(state in status for state in tabOk):
+        send_ok(message)
+    else:
+        if args.critical:
+            send_critical(message)
+        else:
+            send_warning(message)
+
+
+# Mode: Workers
+###############################################################################
+def check_workers(args, dom):
+    # Setup variables
+    results = {}
+
+    # Get status
+    try:
+        service = dom.find('./service')
+        status = service.get('status')
+        workers = dom.findall('./machines/*/'+args.mode)
+        for worker in workers:
+            if args.worker in worker.attrib['worker']:
+                try:
+                    results[worker.attrib['status']].append(
+                        worker.attrib['worker']
+                    )
+                except:
+                    results[worker.attrib['status']] = [
+                        worker.attrib['worker']
+                    ]
+            # If checking the filestore worker, get the filestore specific
+            # perf data too
+            if args.mode == 'filestore':
+                perfData['pendingtransfers'] = worker.attrib['pendingTransfers']
+                perfData['failedtransfers'] = worker.attrib['failedTransfers']
+    except Exception as err:
+        send_warning(str(err))
+    logging.debug(pprint.pformat(results))
+
+    # Build the Opsview message
+    message = ''
+
+    # Handle no workers
+    if len(results) == 0:
+        send_warning("No workers found for "+args.worker+" "+str(workers))
+    for key, val in results.items():
+        # grammar for single result
+        if len(val) == 1:
+            tmp = '{} {} worker is {}'.format(
+                len(results[key]),
+                args.mode,
+                key
+            )
+        # multiple results
+        else:
+            tmp = '{} {} workers are {}'.format(
+                len(results[key]),
+                args.mode,
+                key
+            )
+        if len(message) == 0:
+            message += tmp
+        else:
+            message += ', '+tmp
+        # Perfdata
+        perfData[key.lower()] = len(val)
+
+    # Add perfdata to outbound message
+    message += ' |'
+    for key, val in perfData.items():
+        message += ' '+key.lower()+'='+str(val)
+
+    # If there are no 'Active' workers, default to critical but allow
+    # warning override
+    if not any(state in results for state in tabOk):
+        if args.warning:
+            send_warning(message)
+        else:
+            send_critical(message)
+    # If there is a mix of 'Active' and other status, default to warning
+    # but allow override
+    elif any(state in results for state in tabNotok):
+        if args.critical:
+            send_critical(message)
+        else:
+            send_warning(message)
+    else:
+        send_ok(message)
+
+
+# Setup Session
+###############################################################################
+def setup_session(args):
+    # Setup Session
+    s = requests.Session()
+    s.headers.update({'content-type': 'application/xml'})
+    if args.ssl:
+        url = 'https://'+args.host+'/admin/systeminfo.xml'
+    else:
+        url = 'http://'+args.host+'/admin/systeminfo.xml'
+    if args.insecure == True or args.ssl == False:
+        s.verify = False
+        requests.packages.urllib3.disable_warnings()
+    else:
+        s.verify = True
+    return(s, url)
+
+
+# Alert Functions
+##############################################################################
+def send_warning(message):
+    print('WARNING - '+message)
+    sys.exit(warn)
+
+
+def send_critical(message):
+    print('CRITICAL - '+message)
+    sys.exit(crit)
+
+
+def send_ok(message):
+    print('OK - '+message)
+    sys.exit(ok)
+
+
+def send_unknown(message):
+    print('UNKNOWN - '+message)
+    sys.exit(unknown)
+
+
+# Main
+###############################################################################
+def main():
+    args = get_args()
+    logging.basicConfig(level=getattr(logging, args.logLevel.upper()))
+    session, url = setup_session(args)
+    dom = get_dom(args, url, session)
+    if args.mode == 'service':
+        check_service(args, dom)
+    else:
+        if args.worker:
+            check_workers(args, dom)
+        else:
+            send_warning('A worker must be supplied for this mode')
+    session.close()
+
+
+if __name__ == '__main__':
+    main()

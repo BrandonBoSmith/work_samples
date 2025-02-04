@@ -1,0 +1,527 @@
+#!/usr/bin/env python3
+###############################################################################
+'''
+Description:        Opsview Monitoring plugin that will be used to monitor
+                    Google Cloud native services.
+Author:             Bo Smith (bo@bosmith.tech)
+Date:               2019-10-04
+Requirements:       python3, google-cloud-monitoring
+                    json file for a service account
+Metric Reference: https://cloud.google.com/monitoring/api/metrics_gcp
+'''
+###############################################################################
+
+import argparse
+import json
+import operator
+import os
+import pprint
+import sys
+import time
+from datetime import datetime, timedelta
+from google.cloud import monitoring_v3
+from google.cloud.monitoring_v3.query import Query
+
+
+ok = 0
+warn = 1
+crit = 2
+unknown = 3
+
+
+# Get Args
+###############################################################################
+def get_args():
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description='Opsview plugin to monitor GCP Metrics via StackDriver\n\n'
+        'This plugin takes a combination of various different options \n'
+        'and combines them together to pull a specific metric\n\n'
+        'Pro Tip: Use StackDriver\'s Metric Explorer and View as json\n'
+        'button to find the keys and values you want\n'
+        'Reference: https://cloud.google.com/monitoring/api/metrics_gcp',
+        epilog='Examples:\n'
+        'ILB RTT LATENCIES\n'
+        'check_gcp_stackdriver -j /tmp/opsview.json -p opsview -P \\ \n'
+        '    loadbalancing.googleapis.com -T l3/internal/rtt_latencies --sum_minutes 5 \\ \n'
+        '    --cross_series_reducer REDUCE_PERCENTILE_99 --resource_type internal_tcp_lb_rule\n'
+        'ILB EGRESS BYTES COUNT\n'
+        'check_gcp_stackdriver -j /tmp/opsview.json -p opsview \\ \n'
+        '    -P loadbalancing.googleapis.com -T l3/internal/egress_bytes_count \\ \n'
+        '    --resource_type internal_tcp_lb_rule --load_balancer_name opsview-ha-ilb \\ \n'
+        '    --rate_minutes 1 --cross_series_reducer REDUCE_SUM\n'
+    )
+    required = parser.add_argument_group('required options')
+    metric = parser.add_argument_group('metric labels')
+    resource = parser.add_argument_group('resource labels and resource types')
+    align = parser.add_argument_group('aligners')
+    reducer = parser.add_argument_group('reducers')
+    output = parser.add_argument_group('output options')
+    threshold = parser.add_argument_group('threshold options')
+    required.add_argument(
+        '-j',
+        '--jsonfile',
+        action='store',
+        required=True,
+        help='JSON File with service_account creds'
+    )
+    required.add_argument(
+        '-p',
+        '--project',
+        action='store',
+        required=True,
+        help='GCP Project ID',
+    )
+    required.add_argument(
+        '-P',
+        '--prefix',
+        action='store',
+        required=True,
+        help='Metric Prefix Example: loadbalancing.googleapis.com',
+    )
+    required.add_argument(
+        '-T',
+        '--type',
+        action='store',
+        required=True,
+        help='Metric Type Example: l3/internal/ingress_bytes_cont',
+    )
+    # Metric Labels
+    metric.add_argument(
+        '--client_network',
+        action='store',
+        required=False,
+        help='Metric Label Value for client_network loadbalancing',
+    )
+    metric.add_argument(
+        '--client_subnetwork',
+        action='store',
+        required=False,
+        help='Metric Label Value for client_subnetwork loadbalancing',
+    )
+    metric.add_argument(
+        '--client_zone',
+        action='store',
+        required=False,
+        help='Metric Label Value for client_zone loadbalancing',
+    )
+    metric.add_argument(
+        '--response_code_class',
+        action='store',
+        required=False,
+        help='Metric Label Value for response_code_class HTTPS LB',
+    )
+    # aligners
+    align.add_argument(
+        '--mean_minutes',
+        action='store',
+        required=False,
+        help='ALIGN_MEAN with a value in minutes',
+    )
+    align.add_argument(
+        '--rate_minutes',
+        action='store',
+        required=False,
+        help='ALIGN_RATE with a value in minutes',
+    )
+    align.add_argument(
+        '--sum_minutes',
+        action='store',
+        required=False,
+        help='ALIGN_SUM with a value in minutes',
+    )
+    align.add_argument(
+        '--delta_minutes',
+        action='store',
+        required=False,
+        help='ALIGN_DELTA with a value in minutes',
+    )
+    # Resources
+    resource.add_argument(
+        '--backend_target_name',
+        action='store',
+        required=False,
+        help='Resource Label Value for backend_target_name HTTPS LB',
+    )
+    resource.add_argument(
+        '--database_id',
+        action='store',
+        required=False,
+        help='Resource Label Value for database_id CloudSQL',
+    )
+    resource.add_argument(
+        '--forwarding_rule_name',
+        action='store',
+        required=False,
+        help='Resource Label Value for forwarding_rule_name HTTPS LB',
+    )
+    resource.add_argument(
+        '--load_balancer_name',
+        action='store',
+        required=False,
+        help='Resource Label Value for Load Balancer name'
+    )
+    resource.add_argument(
+        '--resource_name',
+        action='store',
+        required=False,
+        help='Resource Name',
+    )
+    resource.add_argument(
+        '--resource_type',
+        action='store',
+        required=False,
+        help='Resource Type Ex internal_tcp_lb_rule',
+    )
+    # reducers
+    reducer.add_argument(
+        '--cross_series_reducer',
+        action='store',
+        required=False,
+        help='Reducer',
+    )
+    # output options
+    output.add_argument(
+        '-d',
+        '--debug',
+        action='store_true',
+        default=False,
+        required=False,
+        help='Show debug output',
+    )
+    output.add_argument(
+        '--format',
+        action='store',
+        choices=['percent', 'round'],
+        default=False,
+        required=False,
+        help='Format the returned value (Default is raw)\n'
+             'Note: This formatting is done before evaluating the threshold',
+    )
+    output.add_argument(
+        '--decimal',
+        action='store',
+        default=False,
+        required=False,
+        type=int,
+        help='Round the result to the provided decimal place (Default is raw)\n'
+             'Note: This formatting is done before evaluating the threshold',
+    )
+    # thresholds
+    threshold.add_argument(
+        '-C',
+        '--comparison',
+        action='store',
+        required=False,
+        choices=['gt', 'lt'],
+        default='gt',
+        help='Comparison operator to use. Use gt to alert for values greater\n'
+             'than the threshold or lt to alert for values lesser than.\n'
+             'Default is gt.',
+    )
+    threshold.add_argument(
+        '-w',
+        '--warning',
+        action='store',
+        type=float,
+        required=False,
+        help='Warning threshold.',
+    )
+    threshold.add_argument(
+        '-c',
+        '--critical',
+        action='store',
+        type=float,
+        required=False,
+        help='Critical threshold.',
+    )
+    threshold.add_argument(
+        '-ws',
+        '--warn_string',
+        action='append',
+        required=False,
+        help='Issue a Warning alert if the defined string is returned from the check.\n'
+             'This can be repeated multiple times to declare different values',
+    )
+    threshold.add_argument(
+        '-cs',
+        '--crit_string',
+        action='append',
+        required=False,
+        help='Issue Critical alert if the defined string is returned from the check.\n'
+             'This can be repeated multiple times to declare different values',
+    )
+    args = parser.parse_args()
+    return(args)
+
+
+# Setup Client
+###############################################################################
+def setup_client(args):
+    # We need to set up an authenticated 'client' that we will pass to the
+    # various other functions within this plugin
+    # The auth is done via a service account json file
+    try:
+        c = monitoring_v3.gapic.metric_service_client.MetricServiceClient.from_service_account_json(
+            args.jsonfile
+        )
+    except Exception as err:
+        send_unknown(str(err))
+    return(c)
+
+
+# Build Query
+###############################################################################
+def build_query(args, client):
+    # Here we build the query based on the options passed in
+    # there are a lot of options and for the moment we are not putting up any
+    # guardrails so it is possible to build a successful query that returns no
+    # data.
+    metrictype = args.prefix + '/' + args.type
+    now = datetime.utcnow()
+    query = Query(
+        client,
+        args.project,
+        metric_type=metrictype,
+        days=0,
+        hours=0,
+        minutes=5
+    )
+
+    # TODO There must be a smarter way of doing this, **kwargs maybe?
+    # Aligner and Reducer Definitions
+    if args.mean_minutes:
+        query = query.align(
+            'ALIGN_MEAN',
+            minutes=int(args.mean_minutes)
+        )
+    if args.sum_minutes:
+        query = query.align(
+            'ALIGN_SUM',
+            minutes=int(args.sum_minutes)
+        )
+    if args.rate_minutes:
+        query = query.align(
+            'ALIGN_RATE',
+            minutes=int(args.rate_minutes)
+        )
+    if args.delta_minutes:
+        query = query.align(
+            'ALIGN_DELTA',
+            minutes=int(args.delta_minutes)
+        )
+    if args.cross_series_reducer:
+        query = query.reduce(
+            cross_series_reducer=args.cross_series_reducer,
+        )
+
+    # Metric Labels
+    if args.client_network:
+        query = query.select_metrics(
+            client_network=args.client_network
+        )
+    if args.client_subnetwork:
+        query = query.select_metrics(
+            client_subnetwork=args.client_subnetwork
+        )
+    if args.client_zone:
+        query = query.select_metrics(
+            client_zone=args.client_zone
+        )
+    if args.response_code_class:
+        query = query.select_metrics(
+            response_code_class=args.response_code_class
+        )
+
+    # Resource Type
+    if args.resource_type:
+        query = query.select_resources(
+            resource_type=args.resource_type
+        )
+
+    # Resource Labels
+    if args.backend_target_name:
+        query = query.select_resources(
+            backend_target_name=args.backend_target_name
+        )
+    if args.database_id:
+        query = query.select_resources(
+            database_id=args.database_id
+        )
+    if args.forwarding_rule_name:
+        query = query.select_resources(
+            forwarding_rule_name=args.forwarding_rule_name
+        )
+    if args.load_balancer_name:
+        query = query.select_resources(
+            load_balancer_name=args.load_balancer_name
+        )
+
+    return(query)
+
+
+# Execute Query
+###############################################################################
+def run_query(args, client, query):
+    try:
+        data = client.list_time_series(**query._build_query_params())
+    except Exception as err:
+        send_unknown(str(err))
+    for i in data:
+        if args.debug:
+            pprint.pprint(i)
+        result = i.points[0].value
+        try:
+            # Set the initial value in case we don't get any matches below
+            # For some reason, getattr always returns some result even if the attribute
+            # doesn't exist.  The original idea was we'd have value=None if that attribute wasn't
+            # in the result.  Instead, the main object always has either blanks for strings,
+            # 0 for int, or 0.0 for double - or the actual value of the metric.  This messes
+            # up the None test, so instead we check the actual string for the result,
+            # then pull it's value with getattr.
+            value = None
+
+            if "string_value" in str(result):
+                value = getattr(result, 'string_value', None)
+            elif "double_value" in str(result):
+                value = getattr(result, 'double_value', None)
+            elif "int64_value" in str(result):
+                value = getattr(result, 'int64_value', None)
+            elif "distribution_value" in str(result):
+                value = getattr(result, 'distribution_value', None)
+            return(value)
+        except Exception as err:
+            send_unknown('Unable to get value')
+    # If the query had returned either data or an error, we would have exited the function by now
+    # This part is to handle the case of a successful query that returns no data.  Would have been
+    # nice for the API to return zero (or blank for strings) instead of nothing.....
+    return(0)
+
+
+# Format Data
+###############################################################################
+def format_data(args, value):
+    # If needed format the data
+    if args.format == 'percent':
+        # Convert to decimal and round to two decimal places
+        value = round(value * 100, 2)
+    return(value)
+
+
+# Round Data
+###############################################################################
+def round_data(args, value):
+    if args.decimal:
+        value = round(value, args.decimal)
+    return(value)
+
+
+# Process Data from StackDriver
+##############################################################################
+def process_data(args, value):
+    if args.comparison == 'gt':
+        comp = operator.gt
+    if args.comparison == 'lt':
+        comp = operator.lt
+
+    metric = args.type.split('/')[-1]
+    message = metric + ' is ' + str(value)
+    if args.format == 'percent':
+        message = message + '%'
+    # Add performance data
+    if (args.warn_string == None and args.crit_string == None):
+        message += ' | ' + metric + '=' + str(value)
+
+    # Evaluate the conditionals, condinionally depending on the condition...
+    # Hold on to your butts
+    # If both a warning and critical threshold are defined, start at critical
+    if (args.warning and args.critical):
+        if comp(value, args.critical):
+            send_critical(message)
+        elif comp(value, args.warning):
+            send_warning(message)
+        else:
+            send_ok(message)
+    # If only the critical threshold is defined, evaluate just critical
+    elif args.critical:
+        if comp(value, args.critical):
+            send_critical(message)
+        else:
+            send_ok(message)
+    # If only the warning threshold is defined, evaluate just warning
+    elif args.warning:
+        if comp(value, args.warning):
+            send_warning(message)
+        else:
+            send_ok(message)
+    # If both warn_sting and crit_string are defined, start at crit_string
+    elif (args.warn_string and args.crit_string):
+        if value in args.crit_string:
+            send_critical(message)
+        elif value in args.warn_string:
+            send_warning(message)
+        else:
+            send_ok(message)
+    # If only crit_string is defined, evaluate just crit_string
+    elif args.crit_string:
+        if value in args.crit_string:
+            send_critical(message)
+        else:
+            send_ok(message)
+    # If only warn_string is defined, evaluate just warn_string
+    elif args.warn_string:
+        if value in args.warn_string:
+            send_warning(message)
+        else:
+            send_ok(message)
+    # Nothing to see here, move along
+    else:
+        send_ok(message)
+
+    print(value)
+
+
+# Alert Functions
+##############################################################################
+def send_warning(message):
+    print('WARNING - ' + message)
+    sys.exit(warn)
+
+
+def send_critical(message):
+    print('CRITICAL - ' + message)
+    sys.exit(crit)
+
+
+def send_ok(message):
+    print('OK - ' + message)
+    sys.exit(ok)
+
+
+def send_unknown(message):
+    print('UNKNOWN - ' + message)
+    sys.exit(unknown)
+
+
+# Main
+###############################################################################
+def main():
+    args = get_args()
+    client = setup_client(args)
+    query = build_query(args, client)
+    value = run_query(args, client, query)
+
+    # If we are not able to return a metric or status, send an unknown
+    # The "if not value" check is true for both None (null) AND zero.  Change this
+    # to "if value is None" because zero is a valid result for some metrics
+    if value is None:
+        send_unknown('Unable to gather metric')
+    if args.format:
+        value = format_data(args, value)
+    if args.decimal:
+        value = round_data(args, value)
+    process_data(args, value)
+
+
+if __name__ == '__main__':
+    main()

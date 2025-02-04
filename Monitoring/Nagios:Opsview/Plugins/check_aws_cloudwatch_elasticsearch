@@ -1,0 +1,705 @@
+#!/usr/bin/env python3
+##############################################################################
+'''
+Description:	Opsview/Nagios plugin used to monitor AWS managed Elasticsearch 
+                instances.  check_aws_cloudwatch does not handle empty
+                output from cloudwatch very well and empty values show up
+                as unknown so that is why this plugin is being written.
+
+Requirements:	AWS Item            Opsview Variable
+                Access Key          %AWS_CLOUDWATCH_AUTHENTICATION:2%
+                Secret Key          %AWS_CLOUDWATCH_AUTHENTICATION:3%
+                Load Balancer Name  %AWS_ELASTICSEARCH_DOMAIN%
+                    # TODO Example 'Name=,Value=
+                    # TODO Value can be obtained from CloudWatch -> AWS/xxx
+                Metric Name         
+Created:	    2020-09-19
+Author:		    Bo Smith (bo@bosmith.tech)
+'''
+##############################################################################
+import argparse
+import boto3
+import pprint
+import sys
+from datetime import datetime, timedelta
+
+ok = 0
+warn = 1
+crit = 2
+unknown = 3
+
+
+# Get arguments
+##############################################################################
+def get_args():
+    # Put arg choices in variables so we can present them more cleanly in our
+    # --help output
+    metric_choices = [
+        'ClusterStatus',
+        'ClusterIndexWritesBlocked',
+        'MasterReachableFromNode',
+        'AutomatedSnapshotFailure',
+        'Nodes',
+        'FreeStorageSpace',
+        'KibanaHealthyNodes',
+        'DeletedDocuments',
+        'SearchableDocuments',
+        'IndexingRate',
+        'SearchRate',
+        'IndexingLatency',
+        'SearchLatency',
+        '2xx',
+        '3xx',
+        '4xx',
+        '5xx',
+        'ElasticsearchRequests',
+        'InvalidHostHeaderRequests',
+        'MasterCPUUtilization',
+        'MasterJVMMemoryPressure',
+        'CPUUtilization',
+        'JVMMemoryPressure',
+        'SysMemoryUtilization',
+        'JVMGCYoungCollectionCount',
+        'JVMGCYoungCollectionTime',
+        'JVMGCOldCollectionCount',
+        'JVMGCOldCollectionTime',
+        'ThreadpoolWriteThreads',
+        'ThreadpoolWriteQueue',
+        'ThreadpoolWriteRejected',
+        'ThreadpoolSearchThreads',
+        'ThreadpoolSearchQueue',
+        'ThreadpoolSearchRejected',
+        'ThreadpoolForce_mergeThreads',
+        'ThreadpoolForce_mergeQueue',
+        'ThreadpoolForce_mergeRejected'
+    ]
+
+    statistic_choices = ['SampleCount', 'Average', 'Sum', 'Minimum',
+                         'Maximum']
+
+    # Give me all your args and no one gets hurt
+    parser = argparse.ArgumentParser(
+        usage='%(prog)s [-H] [-u] [-p]',
+        description='Opsview plugin to monitor AWS Application ELB')
+    parser.add_argument(
+        '-A',
+        '--accesskey',
+        action='store',
+        required=True,
+        help='Access key',
+        metavar=''
+    )
+    parser.add_argument(
+        '-S',
+        '--secretkey',
+        action='store',
+        required=True,
+        help='Secret Key',
+        metavar=''
+    )
+    parser.add_argument(
+        '-m',
+        '--metric',
+        action='store',
+        required=True,
+        help='Metric to retrieve.  Valid options are ' +
+        ', '.join(metric_choices),
+        choices=metric_choices,
+        metavar=''
+    )
+    parser.add_argument(
+        '-i',
+        '--clientid',
+        action='store',
+        required=True,
+        help='ElasticSearch Client ID',
+        metavar=''
+    )
+    parser.add_argument(
+        '-d',
+        '--domainname',
+        action='store',
+        required=True,
+        help='ElasticSearch Domain Name',
+        metavar=''
+    )
+    parser.add_argument(
+        '-s',
+        '--statistics',
+        action='store',
+        required=True,
+        choices=statistic_choices,
+        help='Cloudwatch statistic. Valid choices are ' +
+        ', '.join(statistic_choices),
+        metavar=''
+    )
+    parser.add_argument(
+        '-r',
+        '--region',
+        action='store',
+        required=False,
+        help='AWS Region',
+        metavar=''
+    )
+    parser.add_argument(
+        '-w',
+        '--warning',
+        action='store',
+        required=False,
+        type=float,
+        help='Warning threshold in percentage',
+        metavar=''
+    )
+    parser.add_argument(
+        '-c',
+        '--critical',
+        action='store',
+        required=False,
+        type=float,
+        help='Critical threshold in percentage',
+        metavar=''
+    )
+    parser.add_argument(
+        '--format_float',
+        action='store',
+        required=False,
+        type=int,
+        help='If set, formats the output to the decimal \
+            place number defined',
+        metavar=''
+    )
+    parser.add_argument(
+        '--starttime',
+        action='store',
+        required=False,
+        type=int,
+        default=300,
+        help='Start time for the cloudwatch query defined \
+            as "X seconds ago" (default 300)',
+        metavar=''
+    )
+    parser.add_argument(
+        '--period',
+        action='store',
+        required=False,
+        type=int,
+        default=60,
+        help='Period in seconds (Default 60 if not provided)',
+        metavar=''
+    )
+    args = parser.parse_args()
+    return(args)
+
+
+# Get Cloudwatch Metrics
+##############################################################################
+def get_metrics(args, metric):
+    # Pull the metric data
+    endtime = datetime.utcnow()
+    starttime = endtime - timedelta(seconds=args.starttime)
+    dimensions = [
+        {'Name': 'ClientId', 'Value': args.clientid},
+        {'Name': 'DomainName', 'Value': args.domainname}
+    ]
+    try:
+        client = boto3.client(
+            'cloudwatch',
+            aws_access_key_id=args.accesskey,
+            aws_secret_access_key=args.secretkey,
+            region_name=args.region
+        )
+    except Exception as err:
+        send_unknown('ERROR - '+str(err))
+    try:
+        response = client.get_metric_statistics(
+            Dimensions=dimensions,
+            MetricName=metric,
+            Namespace='AWS/ES',
+            StartTime=starttime,
+            EndTime=endtime,
+            Period=args.period,
+            Statistics=[args.statistics]
+        )
+    except Exception as err:
+        send_unknown('ERROR - '+str(err))
+
+    # Sort by most recent entry
+    try:
+        response['Datapoints'] = sorted(
+            response['Datapoints'],
+            key=lambda k: k['Timestamp'],
+            reverse=True
+        )
+    except:
+        pass
+    return(response)
+
+
+# Process Metrics Greater Than
+##############################################################################
+def process_metrics_gt(metrics, args):
+    '''
+    Checks if metrics are greater than threshold
+    At this point we should have data to test for thresholds if 
+    thresholds are applied
+    If we want both Critical and Warning alerts
+    '''
+    if args.format_float:
+        ft = '.'+str(args.format_float)+'f'
+        message = args.metric+' is '+str(format(metrics[args.statistics], ft))
+        message += ' | '+args.metric.lower()
+        message += '='+str(format(metrics[args.statistics], ft))
+    else:
+        message = args.metric+' is '+str(metrics[args.statistics])
+        message += ' | '+args.metric.lower()+'='+str(metrics[args.statistics])
+    if args.critical and args.warning:
+        if metrics[args.statistics] >= args.critical:
+            send_critical(message)
+        elif metrics[args.statistics] >= args.warning:
+            send_warning(message)
+        else:
+            send_ok(message)
+    # If we just want critical alerts
+    elif args.critical:
+        if metrics[args.statistics] >= args.critical:
+            send_critical(message)
+        else:
+            send_ok(message)
+    # If we just want warning alerts
+    elif args.warning:
+        if metrics[args.statistics] >= args.warning:
+            send_warning(message)
+        else:
+            send_ok(message)
+    # If we only want to gather the metrics and not alert
+    else:
+        send_ok(message)
+
+
+# Process Metrics Less Than
+##############################################################################
+def process_metrics_lt(metrics, args):
+    '''
+    Checks if metrics are less than threshold
+    At this point we should have data to test for thresholds if 
+    thresholds are applied
+    If we want both Critical and Warning alerts
+    '''
+    if args.format_float:
+        ft = '.'+str(args.format_float)+'f'
+        message = args.metric+' is '+str(format(metrics[args.statistics], ft))
+        message += ' | '+args.metric.lower()
+        message += '='+str(format(metrics[args.statistics], ft))
+    else:
+        message = args.metric+' is '+str(metrics[args.statistics])
+        message += ' | '+args.metric.lower()+'='+str(metrics[args.statistics])
+    if args.critical and args.warning:
+        if metrics[args.statistics] <= args.critical:
+            send_critical(message)
+        elif metrics[args.statistics] <= args.warning:
+            send_warning(message)
+        else:
+            send_ok(message)
+    # If we just want critical alerts
+    elif args.critical:
+        if metrics[args.statistics] <= args.critical:
+            send_critical(message)
+        else:
+            send_ok(message)
+    # If we just want warning alerts
+    elif args.warning:
+        if metrics[args.statistics] <= args.warning:
+            send_warning(message)
+        else:
+            send_ok(message)
+    # If we only want to gather the metrics and not alert
+    else:
+        send_ok(message)
+
+
+# Check Metrics Returned
+##############################################################################
+def check_metrics(args, data):
+    '''
+    If no datapoints were returned but the call was successful, then the
+    metric has no value for this time.  Populate this with zeros so 
+    Opsview can handle it rather than issuing an UNKNOWN
+    '''
+    try:
+        metrics = data['Datapoints'][0]
+    except:
+        if data['ResponseMetadata']['HTTPStatusCode'] == 200:
+            metrics = {}
+            metrics[args.statistics] = float(0.0)
+        else:
+            send_unknown('No datapoints returned')
+    return(metrics)
+
+
+# Metric ClusterStatus
+##############################################################################
+def metric_ClusterStatus(args):
+    # Lets get all possible statuses and report status from there.
+    green_data = get_metrics(args, 'ClusterStatus.green')
+    yellow_data = get_metrics(args, 'ClusterStatus.yellow')
+    red_data = get_metrics(args, 'ClusterStatus.red')
+    try:
+        green_metrics = green_data['Datapoints'][0][args.statistics]
+        yellow_metrics = yellow_data['Datapoints'][0][args.statistics]
+        red_metrics = red_data['Datapoints'][0][args.statistics]
+    except:
+        if green_data['ResponseMetadata']['HTTPStatusCode'] == 200:
+            green_metrics = {}
+            green_metrics[args.statistics] = float(0.0)
+        if yellow_data['ResponseMetadata']['HTTPStatusCode'] == 200:
+            yellow_metrics = {}
+            yellow_metrics[args.statistics] = float(0.0)
+        if red_data['ResponseMetadata']['HTTPStatusCode'] == 200:
+            red_metrics = {}
+            red_metrics[args.statistics] = float(0.0)
+        else:
+            send_unknown('No datapoints returned')
+
+    # Build output string
+    elastic_status = green_data['Label']+': '+str(green_metrics)
+    elastic_status += ' '+yellow_data['Label']+': '+str(yellow_metrics)
+    elastic_status += ' '+red_data['Label']+': '+str(red_metrics)
+    elastic_status += ' | '+green_data['Label'].lower()+'='+str(green_metrics)
+    elastic_status += ' '+yellow_data['Label'].lower()+'='+str(yellow_metrics)
+    elastic_status += ' '+red_data['Label'].lower()+'='+str(red_metrics)
+
+    # Evaluate status in order of most critical
+    if red_metrics > 0.0:
+        send_critical(elastic_status)
+    elif yellow_metrics > 0.0:
+        send_warning(elastic_status)
+    elif (green_metrics > 0.0 and
+          yellow_metrics == 0.0 and
+          red_metrics == 0.0):
+        send_ok(elastic_status)
+    else:
+        send_unknown(elastic_status)
+
+
+# Metric ClusterIndexWritesBlocked
+##############################################################################
+def metric_ClusterIndexWritesBlocked(args):
+    data = get_metrics(args, args.metric)
+    metrics = check_metrics(args, data)
+    process_metrics_lt(metrics, args)
+
+
+# Metric MasterReachableFromNode
+##############################################################################
+def metric_MasterReachableFromNode(args):
+    data = get_metrics(args, args.metric)
+    metrics = check_metrics(args, data)
+    process_metrics_lt(metrics, args)
+
+
+# Metric AutomatedSnapshotFailure
+##############################################################################
+def metric_AutomatedSnapshotFailure(args):
+    data = get_metrics(args, args.metric)
+    metrics = check_metrics(args, data)
+    process_metrics_gt(metrics, args)
+
+
+# Metric Nodes
+##############################################################################
+def metric_Nodes(args):
+    data = get_metrics(args, args.metric)
+    metrics = check_metrics(args, data)
+    process_metrics_lt(metrics, args)
+
+
+# Metric FreeStorageSpace
+##############################################################################
+def metric_FreeStorageSpace(args):
+    data = get_metrics(args, args.metric)
+    metrics = check_metrics(args, data)
+    # Convert to GB
+    metrics[args.statistics] = metrics[args.statistics] / 1024
+    process_metrics_lt(metrics, args)
+
+
+# Metric KibanaHealthyNodes
+##############################################################################
+def metric_KibanaHealthyNodes(args):
+    data = get_metrics(args, args.metric)
+    metrics = check_metrics(args, data)
+    process_metrics_lt(metrics, args)
+
+
+# Metric DeletedDocuments
+##############################################################################
+def metric_DeletedDocuments(args):
+    data = get_metrics(args, args.metric)
+    metrics = check_metrics(args, data)
+    process_metrics_lt(metrics, args)
+
+
+# Metric SearchableDocuments
+##############################################################################
+def metric_SearchableDocuments(args):
+    data = get_metrics(args, args.metric)
+    metrics = check_metrics(args, data)
+    process_metrics_lt(metrics, args)
+
+
+# Metric IndexingRate
+##############################################################################
+def metric_IndexingRate(args):
+    data = get_metrics(args, args.metric)
+    metrics = check_metrics(args, data)
+    process_metrics_lt(metrics, args)
+
+
+# Metric SearchRate
+##############################################################################
+def metric_SearchRate(args):
+    data = get_metrics(args, args.metric)
+    metrics = check_metrics(args, data)
+    process_metrics_lt(metrics, args)
+
+
+# Metric IndexingLatency
+##############################################################################
+def metric_IndexingLatency(args):
+    data = get_metrics(args, args.metric)
+    metrics = check_metrics(args, data)
+    process_metrics_lt(metrics, args)
+
+
+# Metric SearchLatency
+##############################################################################
+def metric_SearchLatency(args):
+    data = get_metrics(args, args.metric)
+    metrics = check_metrics(args, data)
+    process_metrics_lt(metrics, args)
+
+
+# Metric 2xx
+##############################################################################
+def metric_2xx(args):
+    data = get_metrics(args, args.metric)
+    metrics = check_metrics(args, data)
+    process_metrics_lt(metrics, args)
+
+
+# Metric 3xx
+##############################################################################
+def metric_3xx(args):
+    data = get_metrics(args, args.metric)
+    metrics = check_metrics(args, data)
+    process_metrics_lt(metrics, args)
+
+
+# Metric 4xx
+##############################################################################
+def metric_4xx(args):
+    data = get_metrics(args, args.metric)
+    metrics = check_metrics(args, data)
+    process_metrics_gt(metrics, args)
+
+
+# Metric 5xx
+##############################################################################
+def metric_5xx(args):
+    data = get_metrics(args, args.metric)
+    metrics = check_metrics(args, data)
+    process_metrics_gt(metrics, args)
+
+
+# Metric ElasticsearchRequests
+##############################################################################
+def metric_ElasticsearchRequests(args):
+    data = get_metrics(args, args.metric)
+    metrics = check_metrics(args, data)
+    process_metrics_gt(metrics, args)
+
+
+# Metric InvalidHostHeaderRequests
+##############################################################################
+def metric_InvalidHostHeaderRequests(args):
+    data = get_metrics(args, args.metric)
+    metrics = check_metrics(args, data)
+    process_metrics_gt(metrics, args)
+
+
+# Metric MasterCPUUtilization
+##############################################################################
+def metric_MasterCPUUtilization(args):
+    data = get_metrics(args, args.metric)
+    metrics = check_metrics(args, data)
+    process_metrics_gt(metrics, args)
+
+
+# Metric MasterJVMMemoryPressure
+##############################################################################
+def metric_MasterJVMMemoryPressure(args):
+    data = get_metrics(args, args.metric)
+    metrics = check_metrics(args, data)
+    process_metrics_gt(metrics, args)
+
+
+# Metric CPUUtilization
+##############################################################################
+def metric_CPUUtilization(args):
+    data = get_metrics(args, args.metric)
+    metrics = check_metrics(args, data)
+    process_metrics_gt(metrics, args)
+
+
+# Metric JVMMemoryPressure
+##############################################################################
+def metric_JVMMemoryPressure(args):
+    data = get_metrics(args, args.metric)
+    metrics = check_metrics(args, data)
+    process_metrics_gt(metrics, args)
+
+
+# Metric SysMemoryUtilization
+##############################################################################
+def metric_SysMemoryUtilization(args):
+    data = get_metrics(args, args.metric)
+    metrics = check_metrics(args, data)
+    process_metrics_gt(metrics, args)
+
+
+# Metric JVMGCYoungCollectionCount
+##############################################################################
+def metric_JVMGCYoungCollectionCount(args):
+    data = get_metrics(args, args.metric)
+    metrics = check_metrics(args, data)
+    process_metrics_gt(metrics, args)
+
+
+# Metric JVMGCYoungCollectionTime
+##############################################################################
+def metric_JVMGCYoungCollectionTime(args):
+    data = get_metrics(args, args.metric)
+    metrics = check_metrics(args, data)
+    process_metrics_gt(metrics, args)
+
+
+# Metric JVMGCOldCollectionCount
+##############################################################################
+def metric_JVMGCOldCollectionCount(args):
+    data = get_metrics(args, args.metric)
+    metrics = check_metrics(args, data)
+    process_metrics_gt(metrics, args)
+
+
+# Metric JVMGCOldCollectionTime
+##############################################################################
+def metric_JVMGCOldCollectionTime(args):
+    data = get_metrics(args, args.metric)
+    metrics = check_metrics(args, data)
+    process_metrics_gt(metrics, args)
+
+
+# Metric ThreadpoolWriteThreads
+##############################################################################
+def metric_ThreadpoolWriteThreads(args):
+    data = get_metrics(args, args.metric)
+    metrics = check_metrics(args, data)
+    process_metrics_gt(metrics, args)
+
+
+# Metric ThreadpoolWriteQueue
+##############################################################################
+def metric_ThreadpoolWriteQueue(args):
+    data = get_metrics(args, args.metric)
+    metrics = check_metrics(args, data)
+    process_metrics_gt(metrics, args)
+
+
+# Metric ThreadpoolWriteRejected
+##############################################################################
+def metric_ThreadpoolWriteRejected(args):
+    data = get_metrics(args, args.metric)
+    metrics = check_metrics(args, data)
+    process_metrics_gt(metrics, args)
+
+
+# Metric ThreadpoolSearchThreads
+##############################################################################
+def metric_ThreadpoolSearchThreads(args):
+    data = get_metrics(args, args.metric)
+    metrics = check_metrics(args, data)
+    process_metrics_gt(metrics, args)
+
+
+# Metric ThreadpoolSearchQueue
+##############################################################################
+def metric_ThreadpoolSearchQueue(args):
+    data = get_metrics(args, args.metric)
+    metrics = check_metrics(args, data)
+    process_metrics_gt(metrics, args)
+
+
+# Metric ThreadpoolSearchRejected
+##############################################################################
+def metric_ThreadpoolSearchRejected(args):
+    data = get_metrics(args, args.metric)
+    metrics = check_metrics(args, data)
+    process_metrics_gt(metrics, args)
+
+
+# Metric ThreadpoolForce_mergeThreads
+##############################################################################
+def metric_ThreadpoolForce_mergeThreads(args):
+    data = get_metrics(args, args.metric)
+    metrics = check_metrics(args, data)
+    process_metrics_gt(metrics, args)
+
+
+# Metric ThreadpoolForce_mergeQueue
+##############################################################################
+def metric_ThreadpoolForce_mergeQueue(args):
+    data = get_metrics(args, args.metric)
+    metrics = check_metrics(args, data)
+    process_metrics_gt(metrics, args)
+
+
+# Metric ThreadpoolForce_mergeRejected
+##############################################################################
+def metric_ThreadpoolForce_mergeRejected(args):
+    data = get_metrics(args, args.metric)
+    metrics = check_metrics(args, data)
+    process_metrics_gt(metrics, args)
+
+
+# Alert Functions
+##############################################################################
+def send_warning(message):
+    print('WARNING - '+message)
+    sys.exit(warn)
+
+
+def send_critical(message):
+    print('CRITICAL - '+message)
+    sys.exit(crit)
+
+
+def send_ok(message):
+    print('OK - '+message)
+    sys.exit(ok)
+
+
+def send_unknown(message):
+    print('UNKNOWN - '+message)
+    sys.exit(unknown)
+
+
+# Git-r-done!
+##############################################################################
+def main():
+    args = get_args()
+    # Combine the metric with 'metric_' to call the appropriate function
+    globals()['metric_'+args.metric](args)
+
+
+if __name__ == "__main__":
+    main()

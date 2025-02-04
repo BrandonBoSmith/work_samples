@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+'''
+Description:    Opsview plugin to get the health of a ksqldb host
+Author:         Bo Smith (bo@bosmith.tech)
+Date:           2021-05-11
+'''
+import argparse
+import json
+import requests
+import pprint
+import sys
+
+ok = 0
+warn = 1
+crit = 2
+unknown = 3
+
+
+# Get Arguments
+###############################################################################
+def get_args():
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description='Opsview plugin to check the health of a ksqlDB system.',
+        epilog='Examples:\n'
+        'check_ksqldb -H host.example.com -p 8088 -l warning -t 15'
+    )
+    parser.add_argument(
+        '-H',
+        '--hostaddress',
+        action='store',
+        required=True,
+        help='DNS name or IP address of target host'
+    )
+    parser.add_argument(
+        '-p',
+        '--port',
+        action='store',
+        default=8088,
+        required=False,
+        help='TCP Port the ksqlDB instance is running on.\n'
+        '\tDefault is 8088'
+    )
+    parser.add_argument(
+        '-s',
+        '--ssl',
+        action='store_true',
+        default=False,
+        required=False,
+        help='SSL Mode on/off.\n'
+        '\tDefault: off'
+    )
+    parser.add_argument(
+        '-l',
+        '--level',
+        action='store',
+        choices=['warning', 'critical'],
+        default='critical',
+        required=False,
+        help='Alert level. warning/critical\n'
+        '\tDefault: critical'
+    )
+    parser.add_argument(
+        '-t',
+        '--timeout',
+        action='store',
+        default=10,
+        required=False,
+        type=int,
+        help='Response timeout in seconds\n'
+        '\tDefault: 10'
+    )
+    return(parser.parse_args())
+
+
+# Get Health
+###############################################################################
+def get_health(args):
+    if args.ssl is True:
+        url = f'https://{args.hostaddress}:{args.port}/healthcheck'
+    else:
+        url = f'http://{args.hostaddress}:{args.port}/healthcheck'
+    try:
+        h = requests.get(
+            url,
+            timeout=args.timeout
+        )
+        health = h.json()
+        h.raise_for_status()
+        return(health)
+    except requests.exceptions.HTTPError as err:
+        send_alert(args, f'Unable to get health: {str(err)}')
+    except requests.exceptions.Timeout as err:
+        send_alert(args, f'No response received within {args.timeout} seconds')
+
+
+# Check Health
+##############################################################################
+def check_health(args, health):
+    alerts = {}
+    try:
+        details = health['details']
+    except:
+        send_alert(args, f'API call succeeded but health details not found')
+    for key, value in details.items():
+        if value['isHealthy'] is False:
+            alerts[key] = 'Not Healthy'
+
+    if len(alerts) > 0:
+        message = ''
+        count = 0
+        for key, value in alerts.items():
+            if count > 0:
+                line = f', {key} is {value}'
+            else:
+                line = f'{key} is {value}'
+            message += line
+            count += 1
+        send_alert(args, message)
+    else:
+        send_ok('All systems are healthy')
+
+
+# Send Alert
+##############################################################################
+def send_alert(args, message):
+    if args.level == 'critical':
+        send_critical(message)
+    elif args.level == 'warning':
+        send_warning(message)
+    else:
+        send_unknown(message)
+
+
+# Alert Functions
+##############################################################################
+def send_warning(message):
+    print('WARNING - '+message)
+    sys.exit(warn)
+
+
+def send_critical(message):
+    print('CRITICAL - '+message)
+    sys.exit(crit)
+
+
+def send_ok(message):
+    print('OK - '+message)
+    sys.exit(ok)
+
+
+def send_unknown(message):
+    print('UNKNOWN - '+message)
+    sys.exit(unknown)
+
+
+# Main
+###############################################################################
+def main():
+    args = get_args()
+    health = get_health(args)
+    check_health(args, health)
+
+
+if __name__ == '__main__':
+    main()

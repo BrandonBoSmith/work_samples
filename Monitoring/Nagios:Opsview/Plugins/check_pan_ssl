@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+#########################################################
+# Description:	This is a wrapper plugin used to remotely
+#		executy check_logs via NRPE but also
+#		give the ability to override the default
+#		alert level.
+# Author:	Bo Smith (bo@bosmith.tech)
+# Date: 	20171025
+# Dependencies:	NRPE,
+# Modules Used:	OS, GetOpt
+#########################################################
+import subprocess
+import argparse
+import pprint
+import sys
+import re
+
+parser = argparse.ArgumentParser(
+    prog='check_pan_ssl',
+    usage='%(prog)s -H -C',
+    description='Opsview plugin to monitor pan ssl certificates')
+parser.add_argument('-H', '--host', action='store', required=True,
+                    help='Hostname or IP address')
+parser.add_argument('-C', '--certificate', action='store', required=True,
+                    help='Certificate expiration in terms of days')
+parser.add_argument('-w', '--warning', action='store_true', default=True, required=False,
+                    help='Certificate expiration in terms of days')
+parser.add_argument('-c', '--critical', action='store_true', default=False, required=False,
+                    help='Certificate expiration in terms of days')
+args = parser.parse_args()
+host = args.host
+certificate = args.certificate
+svc_warn = args.warning
+svc_crit = args.critical
+svc_time = 24
+ops_ok = 0
+ops_warning = 1
+ops_critical = 2
+ops_unknown = 3
+cmd = ['/opt/opsview/monitoringscripts/plugins/check_http',
+       '-H', host, '-C', certificate]
+
+
+# Execute
+#########################################################
+# Get results from check_http
+try:
+    results = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    results.wait()
+except Exception as err:
+    print('UNKNOWN - '+str(err))
+    sys.exit(ops_unknown)
+
+# Parse results and bail out if there are any problems
+try:
+    result = results.stdout.read().decode().split(" - ")[1].strip()
+except Exception as err:
+    print('UNKNOWN - '+str(err))
+    sys.exit(ops_unknown)
+
+# Setup alert based on return code and our thresholds
+if results.returncode == 0:
+    print('OK: '+result)
+    sys.exit(ops_ok)
+elif svc_crit == True:
+    print('CRITICAL: '+result)
+    sys.exit(ops_critical)
+elif svc_warn == True:
+    print('WARNING: '+result)
+    sys.exit(ops_warning)
+else:
+    print('UNKNOWN: '+result)
+    sys.exit(ops_unknown)

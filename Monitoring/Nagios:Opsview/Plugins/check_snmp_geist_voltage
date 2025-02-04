@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+######################################################################
+# Description:		Nagios/Opsview plugin to check voltage metrics
+#			grom a Geist pdu
+#
+# Author:		Bo Smith (bo@bosmith.tech)
+# Creation Date:	2017-09-25
+# Dependencies:	python-netsnmp, python-getopt, POWERNET mib
+######################################################################
+import netsnmp
+import argparse
+import sys
+import re
+
+# Nagios Variables
+STATE_OK = 0
+STATE_WARNING = 1
+STATE_CRITICAL = 2
+STATE_UNKNOWN = 3
+
+# Check Variables
+temp = {}
+warn = 0
+crit = 0
+warn_low = 0
+warn_high = 0
+crit_low = 0
+crit_high = 0
+warning = False
+critical = False
+status_string = ''
+perf_string = ' | '
+name = ''
+volt = ''
+
+# Parse arguments
+#####################################################################
+parser = argparse.ArgumentParser(
+    prog='check_snmp_geist_voltage',
+    description='Opsview plugin to monitor voltage on a Geist PDU',
+    usage='%(prog)s -H [host] -v [snmp version] -C [snmpcommunity string]')
+parser.add_argument('-H', '--host', action='store', required=True, metavar='',
+                    help='IP Address or hostname of the PDU')
+parser.add_argument('-v', '--version', action='store', required=True, metavar='',
+                    help='SNMP Version to use')
+parser.add_argument('-C', '--community', action='store', required=True, metavar='',
+                    help='SNMP Version 2 community string')
+parser.add_argument('-a', '--authproto', action='store', required=False, metavar='',
+                    help='SNMP Version 3 Authentication Protocol')
+parser.add_argument('-A', '--authkey', action='store', required=False, metavar='',
+                    help='SNMP Version 3 Authentication Key')
+parser.add_argument('-l', '--seclevel', action='store', default='authPriv', required=False, metavar='',
+                    help='SNMP Version 3 Security Level (Default \'AuthPriv\')')
+parser.add_argument('-x', '--privproto', action='store', required=False, metavar='',
+                    help='SNMP Version 3 Privacy Protocol')
+parser.add_argument('-X', '--privkey', action='store', required=False, metavar='',
+                    help='SNMP Version 3 Privacy Key')
+parser.add_argument('-u', '--secuser', action='store', required=False, metavar='',
+                    help='SNMP Version 3 Security User')
+parser.add_argument('-w', '--warning', action='store', required=False, metavar='',
+                    help='Warning threshold (optional)', default=None)
+parser.add_argument('-c', '--critical', action='store', required=False, metavar='',
+                    help='Critical threshold (optional)', default=None)
+
+# Assign argments to variables
+args = parser.parse_args()
+DestHost = args.host
+Version = args.version
+Community = args.community
+SecLevel = args.seclevel
+AuthProto = args.authproto
+AuthPass = args.authkey
+PrivProto = args.privproto
+PrivPass = args.privkey
+SecName = args.secuser
+warn = args.warning
+crit = args.critical
+
+# Check that all the arguments make sense
+if (Version == '2') or (Version == '2c'):
+    if Version == '2c':
+        Version = '2'
+    if Community == '':
+        print(
+            "Error: Version 2 requires a community string, see -h or --help for assistance")
+        sys.exit(3)
+    else:
+        session = netsnmp.Session(
+            DestHost=DestHost, Version=int(Version), Community=Community)
+if Version == '3':
+    if DestHost == '' or AuthProto == '' or AuthPass == '' or PrivProto == '' or PrivPass == '' or SecName == '':
+        print("Error: Version 3 requires AuthProto, AuthPass, PrivProto, PrivPass and SecName\nSee -h or --help for assistance")
+        sys.exit(3)
+    else:
+        AuthProto = AuthProto.upper()
+        PrivProto = PrivProto.upper()
+        session = netsnmp.Session(DestHost=DestHost, Version=int(Version),
+                                  SecLevel=SecLevel, AuthProto=AuthProto,
+                                  AuthPass=AuthPass, PrivProto=PrivProto,
+                                  PrivPass=PrivPass, SecName=SecName)
+if (crit == '') and (warn == ''):
+    print('Error: a Warning or Critical threshold must be supplied')
+    print(helpfile)
+    sys.exit(3)
+
+# Test to make sure we can connect, if fail try up to 3x
+#####################################################################
+attempt = 0
+while attempt < 3:
+    descr = session.get(netsnmp.VarList(
+        netsnmp.Varbind("SNMPv2-MIB::sysDescr.0")))
+    descr = descr[0]
+    if descr != None:
+        break
+    else:
+        attempt += 1
+    # if attempt == 3:
+    #	print('UNKNOWN - Unable to connect via SNMP')
+    #	sys.exit(STATE_UNKNOWN)
+
+# Perform SNMP call/s
+#####################################################################
+count = 0
+for i in session.walk(netsnmp.VarList(netsnmp.Varbind("GEIST-IMD-MIB::pduPhaseIndex"))):
+    try:
+        t = i.decode()
+        results = session.get(netsnmp.VarList(netsnmp.Varbind(
+            "GEIST-IMD-MIB::pduPhaseName", t), netsnmp.Varbind("GEIST-IMD-MIB::pduPhaseVoltage", t)))
+        name = results[0].decode()
+    except Exception as e:
+        print('UNKNOWN: Unable to process the information from the PDU '+str(e))
+        sys.exit(STATE_UNKNOWN)
+    if name:
+        name = name.replace(' ', '_')
+    try:
+        volt = results[1].decode()
+        volt = float(volt)
+        volt = volt * .1
+    except Exception as e:
+        print('UNKNOWN: An issue occurred processing the values ' +
+              str(volt)+' '+str(e))
+        sys.exit(STATE_UNKNOWN)
+
+    # Evaluate results
+    if crit:
+        if re.search(r'(.+\:.+)', str(crit)) is None:
+            if (crit > 0) and (volt >= float(crit)):
+                # If critical threshold is set, evaluate
+                critical = True
+        if (volt > 0) and (re.search(r'(.+\:.+)', str(crit))):
+            crit_low = float(crit.split(':')[0])
+            crit_high = float(crit.split(':')[1])
+            # If critical threshold is set, evaluate
+            if (volt <= crit_low) or (volt >= crit_high):
+                critical = True
+    elif warn:
+        if re.search(r'(.+\:.+)', str(warn)) is None:
+            if (warn > 0) and (volt >= float(warn)):
+                # If critical threshold is set, evaluate
+                warning = True
+        if (volt > 0) and (re.search(r'(.+\:.+)', str(warn))):
+            warn_low = float(warn.split(':')[0])
+            warn_high = float(warn.split(':')[1])
+            # If warning threshold is set, evaluate
+            if (volt <= warn_low) or (volt >= warn_high):
+                warning = True
+
+    status_string = status_string+' '+name+' Voltage:'+str(volt)
+    if count > 0:
+        perf_string = perf_string+' '+name+'_voltage='+str(volt)
+    else:
+        perf_string = perf_string+name+'_voltage='+str(volt)
+    count += 1
+
+perf_string = perf_string.lower()
+
+if critical == True:
+    print('CRITICAL:'+status_string+perf_string)
+    sys.exit(STATE_CRITICAL)
+elif warning == True:
+    print('WARNING:'+status_string+perf_string)
+    sys.exit(STATE_WARNING)
+elif volt == '':
+    print('UNKNOWN: Unable to get voltage')
+    sys.exit(STATE_UNKNOWN)
+else:
+    print('OK:'+status_string+perf_string)
+    sys.exit(STATE_OK)

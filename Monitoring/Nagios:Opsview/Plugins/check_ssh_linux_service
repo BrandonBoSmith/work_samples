@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+##############################################################################
+'''
+Description:	Opsview/Nagios plugin used to monitor linux service status
+                 via ssh
+Requirements:	Requires a username/password or username/ssh key
+                Debian 9 requires sudo *bastards*
+Supported OS:   Tested on 
+                CentOS 7
+                Centos 6 (/etc/redhat-release method)
+                Ubuntu 18.04
+                Ubuntu 14.04
+Created:	    2019-05-20
+Author:		    Bo Smith (bo@bosmith.tech)
+'''
+##############################################################################
+import argparse
+import io
+import paramiko
+import sys
+
+ok = 0
+warn = 1
+crit = 2
+unknown = 3
+cmd = 'df -h '
+
+
+# Get arguments
+##############################################################################
+def get_args():
+    parser = argparse.ArgumentParser(
+        usage='%(prog)s [-H] [-u] [-p]',
+        description='Opsview plugin to remotely monitor Linux service status via SSH')
+    parser.add_argument(
+        '-H',
+        '--host',
+        action='store',
+        required=True,
+        help='Host name or IP address'
+    )
+    parser.add_argument(
+        '-s',
+        '--sshkey',
+        action='store',
+        default='',
+        required=False,
+        help='SSH Key'
+    )
+    parser.add_argument(
+        '-ss',
+        '--sshkeystring',
+        action='store',
+        default='',
+        required=False,
+        help='SSH Key as String'
+    )
+    parser.add_argument(
+        '-u',
+        '--username',
+        action='store',
+        default='',
+        required=False,
+        help='Username to SSH to the appliance (Assumed \'opsview\' if blank'
+    )
+    parser.add_argument(
+        '-p',
+        '--password',
+        action='store',
+        default='',
+        required=False,
+        help='Password for the user'
+    )
+    parser.add_argument(
+        '-P',
+        '--port',
+        action='store',
+        required=False,
+        default=22,
+        type=int,
+        help='SSH Port to use (Default 22)'
+    )
+    parser.add_argument(
+        '-t',
+        '--timeout',
+        action='store',
+        required=False,
+        default=22,
+        type=int,
+        help='Timeout in Seconds to wait for an SSH connection (default 15)'
+    )
+    parser.add_argument(
+        '-w',
+        '--warning',
+        action='store_true',
+        required=False,
+        default=True,
+        help='Send a WARNING alert'
+    )
+    parser.add_argument(
+        '-c',
+        '--critical',
+        action='store_true',
+        required=False,
+        default=False,
+        help='Send a CRITICAL alert'
+    )
+    parser.add_argument('--service', action='store', required=True,
+                        help='Service to check i.e. /boot')
+    args = parser.parse_args()
+    if (args.username == None and args.sshkey == None):
+        print("Either a username and password combination or ssh key is required")
+        print(parser.print_help())
+        sys.exit(unknown)
+    return(args)
+
+
+# Setup and create Paramiko connection object
+##############################################################################
+def setup_ssh(args):
+    try:
+        # Prep client
+        client = paramiko.SSHClient()
+        client.load_system_host_keys()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        # Build kwargs used to setup ssh connection
+        clientargs = {
+            'banner_timeout': args.timeout,
+            'timeout': args.timeout,
+            'password': args.password,
+            'port': args.port,
+            'username': args.username
+        }
+        # Add ssh key from file if provided as file path
+        if args.sshkey:
+            clientargs['key_filename'] = args.sshkey
+        # Add ssh key from string if provided as string
+        elif args.sshkeystring:
+            s = io.StringIO(args.sshkeystring.replace('\\n', '\n'))
+            opsvkey = paramiko.RSAKey.from_private_key(
+                s,
+                password=args.password
+            )
+            clientargs['pkey'] = opsvkey
+        # Setup Connection
+        client.connect(args.host, **clientargs)
+    except paramiko.AuthenticationException as err:
+        message = 'Authentication failed '+str(err)
+        send_unknown(message)
+    except paramiko.SSHException as err:
+        message = 'Unable to establish SSH connection '+str(err)
+        send_unknown(message)
+    except IOError as err:
+        message = 'Timed Out attempting SSH connection'
+        send_unknown(message)
+    except Exception as err:
+        message = 'Unable to establish SSH connection '+str(err)
+        send_unknown(message)
+    return(client)
+
+
+# Setup the CMD to use
+##############################################################################
+def setup_cmd(client, args):
+    # It is reasonable to assume we might run across systems without systemctl
+    # so let's accomodate for it
+    cmd = {}
+    try:
+        stdin, stdout, stderr = client.exec_command('which systemctl',
+                                                    get_pty=True)
+        # CA-594: Add logic to strip first output line if it's "/usr/bin/id: cannot find name for group ID"
+        # This is to handle unpredictable addition of extra output for OSLogin hosts in GCP
+        data = stdout.readlines()
+        if 'id: cannot find name' in data[0]:
+            del data[0]
+        tmp = data[0].strip()
+    except:
+        send_unknown('problem checking for systemctl command')
+
+    # If the location for systemctl is returned, we're good
+    if tmp.split('/')[-1] == 'systemctl':
+        cmd['type'] = 'systemd'
+        cmd['cmd'] = tmp+' is-active '+args.service
+        return(cmd)
+    # If not, look for service cmd
+    else:
+        try:
+            stdin, stdout, stderr = client.exec_command('ls /sbin/service',
+                                                        get_pty=True)
+            # CA-594: Add logic to strip first output line if it's "/usr/bin/id: cannot find name for group ID"
+            # This is to handle unpredictable addition of extra output for OSLogin hosts in GCP
+            data = stdout.readlines()
+            if 'id: cannot find name' in data[0]:
+                del data[0]
+            tmp = data[0].strip()
+        except:
+            send_unknown('problem checking for service command')
+        if tmp.split('/')[-1] == 'service':
+            cmd['type'] = 'systemvinit'
+            cmd['cmd'] = '/sbin/service '+args.service+' status'
+            return(cmd)
+        else:
+            print('Oh Shit ...')
+
+
+# Gather the Metrics
+##############################################################################
+def get_service(client, cmd, args):
+    results = {}
+    try:
+        stdin, stdout, stderr = client.exec_command(cmd['cmd'], get_pty=True)
+    except Exception as err:
+        send_unknown(str(err))
+    # CA-594: Add logic to strip first output line if it's "/usr/bin/id: cannot find name for group ID"
+    # This is to handle unpredictable addition of extra output for OSLogin hosts in GCP
+    data = stdout.readlines()
+    if 'id: cannot find name' in data[0]:
+        del data[0]
+    results = data[0].strip()
+    # Alert for connection issues
+    if 'Failed to connect' in results:
+        send_unknown(results)
+    # Send data as is for systemctl
+    elif cmd['type'] == 'systemctl':
+        return(results)
+    elif cmd['type'] == 'systemvinit':
+        # Parsing systemv init output is a bit more involved dammmit
+        # Valid services will have a pid in the returned info
+        if 'pid' in results:
+            results = results.split(' ')[-1]
+            results = results.strip('.')
+        # Handle unkown services
+        else:
+            results = results.split()[1:]
+            tmp = ''
+            for i in results:
+                tmp += i+' '
+            results = tmp
+        return(results)
+    else:
+        return(results)
+
+
+# Process Stats
+##############################################################################
+def process_stats(stats, args):
+    message = args.service+' status is '+stats
+    # If we want the alert to be critical
+    if args.critical:
+        if stats != 'active' and stats != 'running':
+            send_critical(message)
+        else:
+            send_ok(message)
+    # If we just want warning alerts
+    elif args.warning:
+        if stats != 'active' and stats != 'running':
+            send_warning(message)
+        else:
+            send_ok(message)
+    # If we only want to gather the metrics and not alert
+    else:
+        send_ok(message)
+
+
+# Alert Functions
+##############################################################################
+def send_warning(message):
+    print('WARNING - '+message)
+    sys.exit(warn)
+
+
+def send_critical(message):
+    print('CRITICAL - '+message)
+    sys.exit(crit)
+
+
+def send_ok(message):
+    print('OK - '+message)
+    sys.exit(ok)
+
+
+def send_unknown(message):
+    print('UNKNOWN - '+message)
+    sys.exit(unknown)
+
+
+# Git-r-done!
+##############################################################################
+def main():
+    args = get_args()
+    client = setup_ssh(args)
+    cmd = setup_cmd(client, args)
+    stats = get_service(client, cmd, args)
+    client.close()
+    process_stats(stats, args)
+
+
+if __name__ == "__main__":
+    main()

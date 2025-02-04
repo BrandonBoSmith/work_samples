@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+#####################################################################
+# Description: 	Nagios/Opsview plugin designed to run a query on an
+#		Oracle database and return the number of failed
+#		logins.
+# Required:	cx_Oracle python module
+#
+# Author: 	Bo Smith (bo@bosmith.tech
+#
+# Date:		2017-07-12
+#
+#####################################################################
+import cx_Oracle
+import getopt
+import sys
+import pprint
+import signal
+import os
+
+ora_host = ''
+ora_user = ''
+ora_pass = ''
+ora_db = ''
+ora_port = '1521'
+ora_warn = 150
+ora_crit = 0
+ops_ok = 0
+ops_warning = 1
+ops_critical = 2
+ops_unknown = 3
+ntimeout = 10
+
+#####################################################################
+helpfile = """Usage: check_oracle_failed_logins -H [host] -u [oracle user] -p [oracle user pass] -d [db name]
+Example: check_oracle_failed_logins -H 10.140.0.8 -u orauser -p orapass -d oradb -P 1521
+    -H, --host          Hostname or IP address of the network device.
+
+    -u, --user		Oracle User
+
+    -p, --pass		Oracle User Password
+
+    -d, --database	Oracle Database Name to connect to
+
+    -P, --port		Database port, default 1521 if not specified
+
+    -t, --timeout	Plugin timeout (default 10 seconds)
+
+    -w, --warning 	Warning Threshold (defaults to 150)
+
+    -c, --critical 	Critical Threshold (optional, no default value)
+
+    -h, --help          This help file."""
+
+if len(sys.argv) > 1:
+    a = sys.argv[1:]
+else:
+    print(helpfile)
+    sys.exit()
+
+# Parse arguments
+#####################################################################
+try:
+    opts, args = getopt.getopt(a, "hH:u:p:d:P:t:w:c:", [
+                               "help", "host=", "user=", "pass=", "database=", "port=", "timeout=", "warning=", "critical="])
+except getopt.GetoptError:
+    print(helpfile)
+    sys.exit(3)
+
+# Assign arguments to variables
+for opt, arg in opts:
+    if opt in ('-h', '--help'):
+        print(helpfile)
+        sys.exit()
+    elif opt in ("-H", "--host"):
+        ora_host = arg
+    elif opt in ("-u", "--user"):
+        ora_user = arg
+    elif opt in ("-p", "--password"):
+        ora_pass = arg
+    elif opt in ("-d", "--database"):
+        ora_db = arg
+    elif opt in ("-P", "--port"):
+        ora_port = arg
+    elif opt in ("-t", "--timeout"):
+        ntimeout = int(arg)
+    elif opt in ("-w", "--warning"):
+        ora_warn = int(arg)
+    elif opt in ("-c", "--critical"):
+        ora_crit = int(arg)
+
+# Timeout function
+#####################################################################
+
+
+def timeout_handler(signum, frame):
+    print('WARNING - Service Check Timed Out')
+    sys.exit(ops_warning)
+
+
+signal.signal(signal.SIGALRM, timeout_handler)
+signal.alarm(ntimeout)
+
+# Setup DB Connection
+#####################################################################
+#ora_query = '''SELECT TO_CHAR(TIMESTAMP,'MM/DD HH24:MI') TIMESTAMP, SUBSTR(OS_USERNAME,1,20) OS_USERNAME, SUBSTR(USERNAME,1,20) USERNAME, SUBSTR(TERMINAL,1,20) TERMINAL, ACTION_NAME, RETURNCODE FROM SYS.DBA_AUDIT_SESSION WHERE RETURNCODE>0 AND TIMESTAMP BETWEEN SYSDATE-1 AND SYSDATE ORDER BY TIMESTAMP DESC'''
+# Removed per DB Team Gulam Thoukheer Shaman (2018-04-25)
+# ora_query = '''SELECT
+#  SUBSTR(USERNAME,1,20) USERNAME,
+# RETURNCODE
+# FROM
+#  SYS.DBA_AUDIT_SESSION
+# WHERE
+#  RETURNCODE>0
+#  AND TIMESTAMP BETWEEN SYSDATE-interval '30' minute AND SYSDATE
+# ORDER BY
+#  TIMESTAMP DESC'''
+ora_query = '''SELECT TO_CHAR(TIMESTAMP,'MM/DD HH24:MI') TIMESTAMP, SUBSTR(OS_USERNAME,1,20) OS_USERNAME, SUBSTR(USERNAME,1,20) USERNAME, SUBSTR(TERMINAL,1,20) TERMINAL, ACTION_NAME, RETURNCODE FROM SYS.auxxaudit WHERE RETURNCODE>0 AND TIMESTAMP BETWEEN SYSDATE-interval '30' minute AND SYSDATE ORDER BY TIMESTAMP DESC'''
+try:
+    #con = cx_Oracle.connect(ora_user + "/" + ora_pass + "@" + ora_host + ":" + ora_port + "/" + ora_db)
+    #con = cx_Oracle.connect(ora_user, ora_pass, ora_host + ":" + ora_port + "/" + ora_db)
+    dsn = '(DESCRIPTION =(ENABLE=BROKEN)(CONNECT_TIMEOUT=3)(RETRY_COUNT=1)(TRANSPORT_CONNECT_TIMEOUT=3)(ADDRESS_LIST =(ADDRESS = (PROTOCOL = TCP)(HOST = ' + \
+        ora_host+')(PORT = '+ora_port + \
+        ')))(CONNECT_DATA =(SERVICE_NAME = '+ora_db+')))'
+    con = cx_Oracle.connect(ora_user+'/'+ora_pass+'@'+dsn)
+except cx_Oracle.DatabaseError as err:
+    error, = err.args
+    print('UNKNOWN - Unable to connect to database ' + str(error))
+    sys.exit(ops_unknown)
+
+cur = con.cursor()
+try:
+    cur.execute(ora_query)
+except cx_Oracle.DatabaseError as err:
+    error, = err.args
+    print('UNKNOWN - Error executing query ' + str(error))
+    sys.exit(ops_unknown)
+#results = cur.fetchall()
+count = 0
+for i in cur:
+    count = count + 1
+cur.close()
+con.close()
+
+# Parse results
+#####################################################################
+if ora_crit > 0:
+    if count >= ora_crit:
+        print('CRITICAL - ' + str(count) +
+              ' failed logins detected | failed_logins=' + str(count))
+        sys.exit(ops_critical)
+    elif count >= ora_warn:
+        print('WARNING - ' + str(count) +
+              ' failed logins detected | failed_logins=' + str(count))
+        sys.exit(ops_warning)
+    else:
+        print('OK - ' + str(count) +
+              ' failed logins detected | failed_logins=' + str(count))
+        sys.exit(ops_ok)
+elif count >= ora_warn:
+    print('WARNING - ' + str(count) +
+          ' failed logins detected | failed_logins=' + str(count))
+    sys.exit(ops_warning)
+else:
+    print('OK - ' + str(count) +
+          ' failed logins detected | failed_logins=' + str(count))
+    sys.exit(ops_ok)

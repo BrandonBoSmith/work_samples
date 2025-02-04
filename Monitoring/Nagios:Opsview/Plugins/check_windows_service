@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+#########################################################
+# Description:	This is a wrapper plugin used to remotely
+#		executy check_logs via NRPE but also
+#		give the ability to override the default
+#		alert level.
+# Author:	Bo Smith (bo@bosmith.tech)
+# Date: 	20171025
+# Dependencies:	NRPE,
+# Modules Used:	OS, GetOpt
+#########################################################
+import os
+import getopt
+import pprint
+import sys
+import re
+
+host = ''
+svc_warn = True
+svc_crit = False
+svc_time = 24
+status = ''
+ops_ok = 0
+ops_warning = 1
+ops_critical = 2
+ops_unknown = 3
+
+# Help File/Check for args
+#########################################################
+helpfile = """Usage: check_windows_service -H [host] -a [args] -w -c
+Example: check_windows_service -H 10.140.0.8 -w
+    -H, --host          Hostname or IP address of the network device.
+
+    -a, --arguments	Arguments for the nsc_checkservicestate plugin
+
+    -t, --time		timeout
+
+    -w, --warning       Alert as a WARNING (default)
+
+    -c, --critical      Alert as a CRITICAL
+
+    -h, --help          This help file."""
+
+if len(sys.argv) > 1:
+    a = sys.argv[1:]
+else:
+    print(helpfile)
+    sys.exit()
+
+# Parse arguments
+#########################################################
+try:
+    opts, args = getopt.getopt(a, "hH:a:b:t:wc", [
+                               "help", "host=", "arguments=", "blacklist=", "time=", "warning", "critical"])
+except getopt.GetoptError:
+    print(helpfile)
+    sys.exit(3)
+
+# Assign arguments to variables
+for opt, arg in opts:
+    if opt in ("-h", "--help"):
+        print(helpfile)
+        sys.exit()
+    elif opt in ("-H", "--host"):
+        host = arg
+    elif opt in ("-a", "--arguments"):
+        svc_args = arg
+    elif opt in ("-t", "--time"):
+        svc_time = arg
+    elif opt in ("-w", "--warning"):
+        svc_warn = True
+    elif opt in ("-c", "--critical"):
+        svc_crit = True
+
+# Execute
+#########################################################
+try:
+    results = os.popen('/opt/opsview/monitoringscripts/plugins/check_nrpe -P TLSv1 -H ' +
+                       host+' -c nsc_checkservicestate -a "'+svc_args+'"')
+    fullstatus = results.readlines()[0].strip()
+except Exception as err:
+    print('UNKNOWN - '+str(err))
+    sys.exit(ops_unknown)
+if fullstatus == 'Connection refused by host':
+    if svc_crit == True:
+        print('CRITICAL: '+fullstatus)
+        sys.exit(ops_critical)
+    elif svc_warn == True:
+        print('WARNING: '+fullstatus)
+        sys.exit(ops_warning)
+else:
+    try:
+        status, service, output = fullstatus.split(':', 2)
+        status = status.strip()
+        service = service.strip()
+        output = output.strip()
+    except Exception as err:
+        print('UNKNOWN - A problem occurred obtaining the service status')
+        sys.exit(ops_unknown)
+if status == 'OK':
+    print('OK: '+service+' '+output)
+    sys.exit(ops_ok)
+elif svc_crit == True:
+    output = output.rsplit(' ', 1)[0]
+    print('CRITICAL: '+service+' '+output)
+    sys.exit(ops_critical)
+elif svc_warn == True:
+    output = output.rsplit(' ', 1)[0]
+    print('WARNING: '+service+' '+output)
+    sys.exit(ops_warning)
+else:
+    print('UNKNOWN: '+fullstatus)
+    sys.exit(ops_unknown)

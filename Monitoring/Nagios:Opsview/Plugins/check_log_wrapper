@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+#########################################################
+# Description:	This is a wrapper plugin used to remotely
+#		executy check_logs via NRPEi but also
+#		give the ability to override the default
+#		alert level.
+# Author:	Bo Smith (bo@bosmith.tech)
+# Date: 	20171025
+# Dependencies:	NRPE
+# Modules Used:	OS, GetOpt
+#########################################################
+import os
+import getopt
+import pprint
+import sys
+import re
+
+host = ''
+log_warn = True
+log_crit = False
+log_time = 24
+log_blacklist = []
+status = ''
+ops_ok = 0
+ops_warning = 1
+ops_critical = 2
+ops_unknown = 3
+
+# Help File/Check for args
+#########################################################
+helpfile = """Usage: ./check_log_wrapper -H [host] -a [args] -w -c
+Example: ./check_log_wrapper -H 10.140.0.8 -w
+    -H, --host          Hostname or IP address of the network device.
+
+    -a, --arguments	Arguments for the check_log plugin
+
+    -b, --blacklist	Blacklist things that might be returned by the query
+
+    -t, --time		timeout
+
+    -w, --warning       Alert as a WARNING (default)
+
+    -c, --critical      Alert as a CRITICAL
+
+    -h, --help          This help file."""
+
+if len(sys.argv) > 1:
+    a = sys.argv[1:]
+else:
+    print(helpfile)
+    sys.exit()
+
+# Parse arguments
+#########################################################
+try:
+    opts, args = getopt.getopt(a, "hH:a:b:t:wc", [
+                               "help", "host=", "arguments=", "blacklist=", "time=", "warning", "critical"])
+except getopt.GetoptError:
+    print(helpfile)
+    sys.exit(3)
+
+# Assign arguments to variables
+for opt, arg in opts:
+    if opt in ("-h", "--help"):
+        print(helpfile)
+        sys.exit()
+    elif opt in ("-H", "--host"):
+        host = arg
+    elif opt in ("-a", "--arguments"):
+        log_args = arg
+    elif opt in ("-b", "--blacklist"):
+        log_blacklist = arg.split(',')
+    elif opt in ("-t", "--time"):
+        log_time = arg
+    elif opt in ("-w", "--warning"):
+        log_warn = True
+    elif opt in ("-c", "--critical"):
+        log_crit = True
+
+# Execute
+#########################################################
+results = os.popen('/opt/opsview/monitoringscripts/plugins/check_nrpe -P TLSv1 -H ' +
+                   host+' -c check_log -a "'+log_args+'"')
+status = results.readlines()[0].strip()
+
+# Strip out blacklisted items if any
+#########################################################
+if log_blacklist != []:
+    for i in log_blacklist:
+        if re.search(r'(.+)'+i+'(.+)', status, re.IGNORECASE) is not True:
+            status = 'Log check ok - 0 pattern matches found'
+
+if status == 'Log check ok - 0 pattern matches found':
+    print('OK: '+status)
+    sys.exit(ops_ok)
+elif log_crit == True:
+    print('CRITICAL: '+status)
+    sys.exit(ops_critical)
+elif log_warn == True:
+    print('WARNING: '+status)
+    sys.exit(ops_warning)

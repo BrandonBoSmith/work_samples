@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+#########################################################
+# Description:	This is a wrapper plugin used to remotely
+#		executy check_ms_win_tasks via NRPE but also
+#		give the ability to override the default
+#		alert level.
+# Author:	Bo Smith (bo@bosmith.tech)
+# Date: 	20171204
+# Dependencies:	NRPE,
+# Modules Used:	OS, GetOpt
+#########################################################
+import os
+import getopt
+import pprint
+import sys
+import re
+
+host = ''
+tsk_warn = True
+tsk_crit = False
+tsk_time = 24
+tsk_name = ''
+tsk_folder = ''
+ops_ok = 0
+ops_warning = 1
+ops_critical = 2
+ops_unknown = 3
+
+# Help File/Check for args
+#########################################################
+helpfile = """Usage: check_win_scheduled_tasks -H [host] -a [args] -w -c
+Example: check_win_scheduled_tasks -H 10.140.0.8 -w
+    -H, --host          Hostname or IP address of the network device.
+
+    -n, --name		Task name 
+
+    -t, --time		timeout
+
+    -w, --warning       Alert as a WARNING (default)
+
+    -c, --critical      Alert as a CRITICAL
+
+    -h, --help          This help file."""
+
+if len(sys.argv) > 1:
+    a = sys.argv[1:]
+else:
+    print(helpfile)
+    sys.exit()
+
+# Parse arguments
+#########################################################
+try:
+    opts, args = getopt.getopt(
+        a, "hH:t:n:wc", ["help", "host=", "time=", "name=", "warning", "critical"])
+except getopt.GetoptError:
+    print(helpfile)
+    sys.exit(3)
+
+# Assign arguments to variables
+for opt, arg in opts:
+    if opt in ("-h", "--help"):
+        print(helpfile)
+        sys.exit()
+    elif opt in ("-H", "--host"):
+        host = arg
+    elif opt in ("-t", "--time"):
+        tsk_time = arg
+    elif opt in ("-n", "--name"):
+        tsk_name = arg
+    elif opt in ("-w", "--warning"):
+        tsk_warn = True
+    elif opt in ("-c", "--critical"):
+        tsk_crit = True
+
+# Execute
+#########################################################
+results = os.popen('/opt/opsview/monitoringscripts/plugins/check_nrpe -P TLSv1 -H ' +
+                   host+' -c check_ms_win_tasks -a "-IT ''\''+tsk_name+'\'"')
+fullstatus = results.readlines()[0].strip()
+print(fullstatus.strip())
+exit()
+if isinstance(fullstatus.split(' ')[0].strip()) is True:
+    taskstat = int(fullstatus.split(' ')[0].strip())
+    tasknum = int(fullstatus.split(' ')[2].strip())
+    status = fullstatus.split('|')[0].strip()
+    perfdata = fullstatus.split('|')[1].strip()
+else:
+    print('UNKNOWN: '+fullstatus.strip())
+    sys.exit(ops_unknown)
+
+
+def alert(data):
+    if tsk_crit == True:
+        print('CRITICAL: '+data)
+        sys.exit(ops_critical)
+    elif tsk_warn == True:
+        print('WARNING: '+data)
+        sys.exit(ops_warning)
+
+
+if re.search('succesful|running', status, re.IGNORECASE) is not None:
+    if (taskstat == 0) and (tasknum == 0):
+        data = status+' | '+perfdata
+        print('UNKNOWN: Unable to find a task with this name')
+        sys.exit(ops_unknown)
+    elif taskstat < tasknum:
+        data = status+' | '+perfdata
+        alert(data)
+    elif taskstat == tasknum:
+        data = status+' | '+perfdata
+        print('OK: '+data)
+        sys.exit(ops_ok)
+elif re.search('failed', status, re.IGNORECASE) is not None:
+    data = status+' | '+perfdata
+    alert(data)
+else:
+    print('UNKNOWN: '+fullstatus)
+    sys.exit(ops_unknown)

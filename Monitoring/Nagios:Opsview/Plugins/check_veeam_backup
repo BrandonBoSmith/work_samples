@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+#########################################################
+# Description:	This is a wrapper plugin used to remotely
+#		executy check_veeam_backup.ps1 via NRPE
+#		but also give the ability to override the
+#		default alert level
+# Author:	Bo Smith (bo@bosmith.tech)
+# Date: 	20170908
+# Dependencies:	NRPE
+# Modules Used:	OS, GetOpt
+#########################################################
+import os
+import pprint
+import sys
+import argparse
+
+ops_ok = 0
+ops_warning = 1
+ops_critical = 2
+ops_unknown = 3
+
+# Parse Arguments
+#########################################################
+parser = argparse.ArgumentParser(
+    prog='check_veeam_backup',
+    description='Plugin for monitoring Veeam backup jobs')
+parser.add_argument('-H', '--host', action='store',
+                    help='Hostname or IP address of the network device', required=True)
+parser.add_argument('-j', '--job', action='store',
+                    help='Veeam backup job name', required=True)
+parser.add_argument('-t', '--time', action='store', default=24,
+                    help='Time in hours to look back for errors (default 24 hours)')
+parser.add_argument('-w', '--warning', action='store_true', default=True,
+                    help='Alert as a WARNING (default)')
+parser.add_argument('-c', '--critical', action='store_true', default=False,
+                    help='Alert as a CRITICAL')
+args = parser.parse_args()
+veeam_host = args.host
+veeam_job = args.job
+veeam_warn = args.warning
+veeam_crit = args.critical
+
+# Execute
+#########################################################
+results = os.popen('/opt/opsview/monitoringscripts/plugins/check_nrpe -P TLSv1 -H ' +
+                   veeam_host+' -c check_veeam_backup -a '+veeam_job)
+results = results.readlines()
+try:
+    status = results[0].split(':')[0]
+    status_line = results[0].split(':')[1].strip()
+except:
+    print('UNKNOWN: '+results[0])
+    sys.exit(ops_unknown)
+
+if status == 'OK':
+    print('OK: '+status_line)
+    sys.exit(ops_ok)
+elif veeam_crit == True:
+    print('CRITICAL: '+status_line)
+    sys.exit(ops_critical)
+elif veeam_warn == True:
+    print('WARNING: '+status_line)
+    sys.exit(ops_warning)

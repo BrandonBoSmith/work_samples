@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+##############################################################################
+'''
+Description:	Opsview/Nagios plugin used to monitor linux disk usage via ssh
+Requirements:	Requires a username/password or username/ssh key
+Created:	    2019-05-17
+Author:		    Bo Smith (bo@bosmith.tech)
+'''
+##############################################################################
+import argparse
+import io
+import paramiko
+import sys
+
+ok = 0
+warn = 1
+crit = 2
+unknown = 3
+cmd = 'df -hP '
+
+
+# Get arguments
+##############################################################################
+def get_args():
+    parser = argparse.ArgumentParser(
+        usage='%(prog)s [-H] [-u] [-p]',
+        description='Opsview plugin to remotely monitor Linux disk usage via SSH')
+    parser.add_argument(
+        '-H',
+        '--host',
+        action='store',
+        required=True,
+        help='Host name or IP address'
+    )
+    parser.add_argument(
+        '-s',
+        '--sshkey',
+        action='store',
+        default='',
+        required=False,
+        help='Path to SSH Key file'
+    )
+    parser.add_argument(
+        '-ss',
+        '--sshkeystring',
+        action='store',
+        default='',
+        required=False,
+        help='SSH Key as String'
+    )
+    parser.add_argument(
+        '-u',
+        '--username',
+        action='store',
+        required=True,
+        help='Username to SSH to the appliance (Assumed \'opsview\' if blank'
+    )
+    parser.add_argument(
+        '-p',
+        '--password',
+        action='store',
+        default='',
+        required=False,
+        help='Password for the user or passphrase for private key'
+    )
+    parser.add_argument(
+        '-P',
+        '--port',
+        action='store',
+        required=False,
+        default=22,
+        type=int,
+        help='SSH Port to use (Default 22)'
+    )
+    parser.add_argument(
+        '-t',
+        '--timeout',
+        action='store',
+        required=False,
+        default=15,
+        type=int,
+        help='Timeout in Seconds to wait for an SSH connection (default 15)'
+    )
+    parser.add_argument(
+        '-w',
+        '--warning',
+        action='store',
+        required=False,
+        type=float,
+        help='Warning threshold in percentage'
+    )
+    parser.add_argument('-c', '--critical', action='store', required=False,
+                        type=float, help='Critical threshold in percentage')
+    parser.add_argument('--partition', action='store', required=True,
+                        help='Partition to check i.e. /boot')
+    args = parser.parse_args()
+    if (args.username == None and args.sshkey == None):
+        print("Either a username and password combination or ssh key is required")
+        print(parser.print_help())
+        sys.exit(unknown)
+    return(args)
+
+
+# Setup and create Paramiko connection object
+##############################################################################
+def setup_ssh(args):
+    try:
+        # Prep client
+        client = paramiko.SSHClient()
+        client.load_system_host_keys()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        # Build kwargs used to setup ssh connection
+        clientargs = {
+            'banner_timeout': args.timeout,
+            'timeout': args.timeout,
+            'password': args.password,
+            'port': args.port,
+            'username': args.username
+        }
+        # Add ssh key from file if provided as file path
+        if args.sshkey:
+            clientargs['key_filename'] = args.sshkey
+        # Add ssh key from string if provided as string
+        elif args.sshkeystring:
+            s = io.StringIO(args.sshkeystring.replace('\\n', '\n'))
+            opsvkey = paramiko.RSAKey.from_private_key(
+                s,
+                password=args.password
+            )
+            clientargs['pkey'] = opsvkey
+        # Setup Connection
+        client.connect(args.host, **clientargs)
+    except paramiko.AuthenticationException as err:
+        message = 'Authentication failed '+str(err)
+        send_unknown(message)
+    except paramiko.SSHException as err:
+        message = 'Unable to establish SSH connection '+str(err)
+        send_unknown(message)
+    except IOError as err:
+        message = 'Timed Out attempting SSH connection'
+        send_unknown(message)
+    except Exception as err:
+        message = 'Unable to set up SSH connection '+str(err)
+        send_unknown(message)
+    return(client)
+
+
+# Gather the Metrics
+##############################################################################
+def get_usage(client, cmd, args):
+    results = {}
+    cmd = cmd + args.partition
+    try:
+        stdin, stdout, stderr = client.exec_command(cmd, get_pty=True)
+    except Exception as err:
+        send_unknown(str(err))
+    try:
+        # CA-594: Add logic to strip first output line if it's "/usr/bin/id: cannot find name for group ID"
+        # This is to handle unpredictable addition of extra output for OSLogin hosts in GCP
+        data = stdout.readlines()
+        if 'id: cannot find name' in data[0]:
+            del data[0]
+        data = data[1].strip().split()
+        results['size'] = data[1]
+        results['used'] = data[2]
+        results['avail'] = data[3]
+        results['usedpct'] = float(data[4].replace('%', ''))
+    except Exception as err:
+        send_unknown("problem reading data from server "+str(err))
+    return(results)
+
+
+# Process Stats
+##############################################################################
+def process_stats(stats, args):
+    message = 'Disk {} usage {}%, size: {}, used: {}, available: {}'.format(
+        args.partition,
+        stats['usedpct'],
+        stats['size'],
+        stats['used'],
+        stats['avail'])
+    message += ' | size={} used={} available={}'.format(
+        stats['size'],
+        stats['used'],
+        stats['avail'])
+    # If we want both Critical and Warning alerts
+    if args.critical and args.warning:
+        if stats['usedpct'] >= args.critical:
+            send_critical(message)
+        elif stats['usedpct'] >= args.warning:
+            send_warning(message)
+        else:
+            send_ok(message)
+    # If we just want critical alerts
+    elif args.critical:
+        if stats['usedpct'] >= args.critical:
+            send_critical(message)
+        else:
+            send_ok(message)
+    # If we just want warning alerts
+    elif args.warning:
+        if stats['usedpct'] >= args.warning:
+            send_warning(message)
+        else:
+            send_ok(message)
+    # If we only want to gather the metrics and not alert
+    else:
+        send_ok(message)
+
+
+# Alert Functions
+##############################################################################
+def send_warning(message):
+    print('WARNING - '+message)
+    sys.exit(warn)
+
+
+def send_critical(message):
+    print('CRITICAL - '+message)
+    sys.exit(crit)
+
+
+def send_ok(message):
+    print('OK - '+message)
+    sys.exit(ok)
+
+
+def send_unknown(message):
+    print('UNKNOWN - '+message)
+    sys.exit(unknown)
+
+
+# Git-r-done!
+##############################################################################
+def main():
+    args = get_args()
+    client = setup_ssh(args)
+    stats = get_usage(client, cmd, args)
+    client.close()
+    process_stats(stats, args)
+
+
+if __name__ == "__main__":
+    main()

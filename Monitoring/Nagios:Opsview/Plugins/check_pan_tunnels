@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+###############################################################################
+'''
+ Description: 		Nagios/Opsview plugin that monitors the status of Palo
+			Alto Firewall IPSec tunnels using the Palo Alto XML API
+ Author:		Bo Smith (bo@bosmith.tech)
+ Creation Date:	2018-05-25
+ Requirements:		Requires a Palo Alto admin api key.  Highly recommend
+			readonly permission be applied.
+ Source: https://www.paloaltonetworks.com/documentation/71/pan-os/xml-api/get-started-with-the-pan-os-xml-api/get-your-api-key
+'''
+import sys
+import argparse
+import xml.etree.ElementTree as ET
+import requests
+import urllib3
+import sys
+import re
+import pprint
+# Uncomment to re-enable warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Parse Arguments
+###############################################################################
+parser = argparse.ArgumentParser(
+    prog='check_pan_tunnels',
+    usage='%(prog)s [-H] [-w] [-c]',
+    description='Plugin for monitoring vpn tunnel status')
+parser.add_argument('-H', '--host', action='store', required=True, metavar='',
+                    help='Hostname or IP Address of the Firewall (Required)')
+parser.add_argument('-k', '--key', action='store', required=True, metavar='',
+                    help='API Key (Required)')
+parser.add_argument('-C', '--connecttime', action='store', required=False, metavar='',
+                    help='Connection timeout in seconds (default is 10 if not set)', default=10)
+parser.add_argument('-i', '--ignore', action='store', required=False, metavar='',
+                    help='Comma separated list of \'Production\' tunnels', default='')
+parser.add_argument('-p', '--prefix', action='store', required=False, metavar='',
+                    help='Only include tunnels with this prefix', default='')
+parser.add_argument('-w', '--warning', action='store_true', required=False,
+                    help='Issue a warning alert of a tunnel is down', default=True)
+parser.add_argument('-c', '--critical', action='store_true', required=False,
+                    help='Issue a critical alert of a tunnel is down', default=False)
+args = parser.parse_args()
+host = args.host
+key = args.key
+conntime = int(args.connecttime)
+tunlist = args.ignore.split(',')
+warn = args.warning
+crit = args.critical
+prefix = args.prefix
+STATE_OK = 0
+STATE_WARNING = 1
+STATE_CRITICAL = 2
+STATE_UNKNOWN = 3
+
+
+# Request HA data from api
+###############################################################################
+def get_ha_data(host, key):
+    url = 'https://' + host + '/api/?type=op&cmd='
+    url += '<show><high-availability><all>'
+    url += '</all></high-availability></show>'
+    url += '&key=' + key
+    try:
+        data = requests.get(url, verify=False, timeout=conntime)
+        data.raise_for_status()
+    except requests.exceptions.RequestException as err:
+        alert_unknown('Exception encountered ' + str(err))
+    return(data.content)
+
+
+# Request tunnel data from api
+###############################################################################
+def get_tun_data(host, key):
+    url = 'https://' + host + '/api/?type=op&cmd='
+    url += '<show><running><tunnel><flow><all>'
+    url += '</all></flow></tunnel></running></show>'
+    url += '&key=' + key
+    try:
+        data = requests.get(url, verify=False, timeout=conntime)
+        data.raise_for_status()
+    except requests.exceptions.RequestException as err:
+        alert_unknown('Exception encountered ' + str(err))
+    return(data.content)
+
+
+# Get HA status from XML DOM
+###############################################################################
+def get_ha_status(data):
+    dom = ET.fromstring(data)
+    try:
+        ha = dom.find('./result/group/local-info/state').text
+    except Exception as err:
+        ha = str(err)
+    return(ha)
+
+
+# Get vpn data from XML DOM
+###############################################################################
+def get_vpn_info(data):
+    all_tunnels = []
+    dom = ET.fromstring(data)
+    tunnels = dom.findall('./result/IPSec/entry')
+    for tunnel in tunnels:
+        tun = {}
+        name = tunnel.find('name').text
+        status = tunnel.find('state').text
+        peerip = tunnel.find('peerip').text
+        tun['name'] = name
+        tun['status'] = status
+        tun['peerip'] = peerip
+        if prefix in name:
+            all_tunnels.append(tun)
+    return(all_tunnels)
+
+
+# Process status and issue any alerts
+###############################################################################
+def process_status(status):
+    total = 0
+    uptun = []
+    downtun = []
+    igntun = []
+    normtun = []
+    prxytun = {}
+    # Separate normal tunnels from tunnels with proxyids
+    for tunnel in status:
+        if re.search(".+\:.+", tunnel['name']) is not None:
+            n = tunnel['name'].split(':')[0]
+            if n not in prxytun:
+                prxytun[n] = []
+                prxytun[n].append(tunnel)
+            else:
+                prxytun[n].append(tunnel)
+        else:
+            normtun.append(tunnel)
+
+    # Divide proxy tunnel status up into individual lists
+    for p, t in prxytun.items():
+        prxycount = len(t)
+        down = 0
+        for tunnel in t:
+            if tunnel['name'] in tunlist:
+                igntun.append(tunnel)
+            elif (tunnel['status'] != 'active' and
+                    tunnel['status'] != 'inactive'):
+                down += 1
+                # downtun.append(tunnel)
+                #print('Tunnel {} is not active with state {}'.format(tunnel['name'], tunnel['status']))
+            total += 1
+        if down == prxycount:
+            downtun.append({'name': p, 'status': 'All ProxyIDs Down'})
+
+    # Divide status up into individual lists
+    for tunnel in normtun:
+        if tunnel['name'] in tunlist:
+            igntun.append(tunnel)
+        elif (tunnel['status'] != 'active' and
+                tunnel['status'] != 'inactive'):
+            downtun.append(tunnel)
+            #print('Tunnel {} is not active with state {}'.format(tunnel['name'], tunnel['status']))
+        else:
+            uptun.append(tunnel)
+        total += 1
+    # Process down tunnels
+    if len(downtun) > 0:
+        output = ''
+        count = 0
+        # Build the output string
+        for tun in downtun:
+            if count > 0:
+                output += ', '
+                output += tun['name'] + ' is ' + tun['status']
+            else:
+                output += tun['name'] + ' is ' + tun['status']
+            count += 1
+        if crit is True:
+            alert_critical('{} Down {} Up {} Total Tunnels {} Ignored {}'.format(
+                str(len(downtun)), str(len(uptun)), str(total), str(len(igntun)), output))
+        elif warn is True:
+            # alert_warning('{} Total Tunnels {} Ignored {} Up {} Down {}'.format(
+            #	str(total), str(len(igntun)), str(len(uptun)), str(len(downtun)), output))
+            alert_warning('{} Down {} Up {} Total Tunnels {} Ignored {}'.format(
+                str(len(downtun)), str(len(uptun)), str(total), str(len(igntun)), output))
+    else:
+        alert_ok('{} Total Tunnels {} Ignored {} Up {} Down'.format(
+            str(total), str(len(igntun)), str(len(uptun)), str(len(downtun))))
+    #print('{} out of {} tunnels are down'.format(str(count), str(len(status))))
+    #print('Tunnel List: {}'.format(tunlist))
+
+
+# Alert Handling Functions
+###############################################################################
+def alert_ok(output):
+    print('OK - {}'.format(output))
+    sys.exit(STATE_OK)
+
+
+def alert_warning(output):
+    print('WARNING - {}'.format(output))
+    sys.exit(STATE_WARNING)
+
+
+def alert_critical(output):
+    print('CRITICAL - {}'.format(output))
+    sys.exit(STATE_CRITICAL)
+
+
+def alert_unknown(output):
+    print('UNKNOWN - {}'.format(output))
+    sys.exit(STATE_UNKNOWN)
+
+
+# MAIN (Let it begin, LET IT BEGIN!)
+###############################################################################
+ha_data = get_ha_data(host, key)
+ha_state = get_ha_status(ha_data)
+# if the firewall is currently passive, bail out
+if ha_state == 'passive':
+    alert_ok('Firewall is currently passive, not checking tunnels')
+
+tun_data = get_tun_data(host, key)
+status = get_vpn_info(tun_data)
+process_status(status)

@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+##############################################################################
+# Description:		Opsview/Nagios plugin used to monitor backup jobs on a
+#			Veritas NetBackup appliance.
+#
+# Requirements:		Requires a 'nagios' user created on the appliance.
+#			Nagios user also needs to be able to execute the
+#			following netbackup commands:
+#			CMD1, CMD2
+#
+# Created:		2018-05-02
+#
+# Author:		Bo Smith (bo@bosmith.tech)
+##############################################################################
+import paramiko
+import pprint
+import argparse
+import sys
+from datetime import datetime
+from datetime import timedelta
+import time
+
+parser = argparse.ArgumentParser(
+    prog='check_ssh_netbackup_jobs',
+    usage='%(prog)s [-H] [-u] [-p]',
+    description='Uses ssh creds to connect to a Veritas NetBackup appliance and get job status')
+parser.add_argument('-H', '--host', action='store', required=True,
+                    help='Host name or IP address')
+parser.add_argument('-u', '--username', action='store', required=True,
+                    help='Username to SSH to the appliance')
+parser.add_argument('-p', '--password', action='store', required=True,
+                    help='Password for the user')
+parser.add_argument('-w', '--warning', action='store_true', default=True,
+                    help='If set, will issue a WARNING (Default)')
+parser.add_argument('-c', '--critical', action='store_true', default=False,
+                    help='If set, will issue a CRITICAL')
+parser.add_argument('-t', '--timeframe', action='store', default=5,
+                    help='How far back in time to look in minutes')
+args = parser.parse_args()
+host = args.host
+username = args.username
+password = args.password
+warning = args.warning
+critical = args.critical
+mins = int(args.timeframe)
+port = 22
+cmd = 'sudo /usr/openv/netbackup/bin/admincmd/bpdbjobs -most_columns'
+ov_ok = 0
+ov_warn = 1
+ov_crit = 2
+ov_unknown = 3
+
+# Setup and connect
+##############################################################################
+try:
+    client = paramiko.SSHClient()
+    client.load_system_host_keys()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(host, port=port, username=username,
+                   password=password, timeout=10)
+except paramiko.AuthenticationException as err:
+    print('WARNING - Authentication failed '+str(err))
+    sys.exit(ov_warn)
+except paramiko.SSHException as err:
+    print('WARNING - Unable to establish SSH connection '+str(err))
+    sys.exit(ov_warn)
+except IOError as err:
+    print('WARNING - Timed Out attempting SSH connection')
+    sys.exit(ov_warn)
+except Exception as err:
+    print('WARNING - Unable to establish SSH connection '+str(err))
+    sys.exit(ov_warn)
+
+# Get local time as seen by NetBackup
+try:
+    stdin, stdout, stderr = client.exec_command('date +%s', get_pty=True)
+    localtime = stdout.readlines()[0].strip()
+    localtime = int(localtime)
+    error = stderr.read().strip()
+except Exception as err:
+    print('WARNING - Unable to get local time: '+str(error))
+    client.close()
+    sys.exit(ov_warn)
+
+localtime = datetime.fromtimestamp(localtime)
+timeframe = localtime - timedelta(minutes=mins)
+# Get the report of jobs from NetBackup
+try:
+    stdin, stdout, stderr = client.exec_command(cmd, get_pty=True)
+    results = stdout.readlines()
+    error = stderr.read().strip()
+    client.close()
+except Exception as err:
+    print('WARNING - Unable to get job status: '+str(error))
+    client.close()
+    sys.exit(ov_warn)
+
+
+# Alert Functions
+##############################################################################
+def send_warning(message):
+    print('WARNING - '+message)
+    sys.exit(ov_warn)
+
+
+def send_critical(message):
+    print('CRITICAL - '+message)
+    sys.exit(ov_crit)
+
+
+def send_ok(message):
+    print('OK - '+message)
+    sys.exit(ov_ok)
+
+# Process Results
+##############################################################################
+
+
+def format_data(results):
+    clean = []
+    if len(results) > 1:
+        for line in results:
+            data = line.split()[0]
+            jobid = data.split(',')[0]
+            jtype = data.split(',')[1]
+            state = data.split(',')[2]
+            status = data.split(',')[3]
+            policy = data.split(',')[4]
+            sched = data.split(',')[5]
+            client = data.split(',')[6]
+            try:
+                stime = datetime.fromtimestamp(int(data.split(',')[8]))
+                etime = datetime.fromtimestamp(int(data.split(',')[10]))
+            except Exception as err:
+                continue
+            # Make the client/host lowercase
+            client = client.lower()
+            if (jtype == '0' or jtype == '6' or jtype == '28' or jtype == '25'):
+                if etime >= timeframe:
+                    etimem = etime.strftime('%d/%m/%y-%H:%M')
+                    stimem = stime.strftime('%d/%m/%y-%H:%M')
+                    data = {'status': status,
+                            'jobid': jobid,
+                            'policy': policy,
+                            'schedule': sched,
+                            'start': stimem,
+                            'end': etimem,
+                            'client': client,
+                            'timeframe': timeframe.strftime('%d/%m/%y-%H:%M')}
+                    clean.append(data)
+    else:
+        clean.append("No results to check")
+    return clean
+
+
+def parse_data(results):
+    output = ''
+    total = len(results)
+    errcount = 0
+    okcount = 0
+    if results == []:
+        pass
+    else:
+        for line in results:
+            if (line['status'] != '0' and
+                    line['status'] != '1' and
+                    line['status'] != '150'):
+                output += "Status: {} ID: {} Policy: {} Sched: {} Start: {} End: {} Client: {}\n".format(
+                    line['status'], line['jobid'], line['policy'], line['schedule'],
+                    line['start'], line['end'], line['client'])
+                errcount += 1
+            else:
+                okcount += 1
+    output = output.rstrip('\n')
+    if output != '':
+        output = str(errcount)+' issues detected '+output
+        if critical:
+            send_critical(output)
+        elif warning:
+            send_warning(output)
+    else:
+        output = 'No failed jobs in the last {} minutes'.format(mins)
+        send_ok(str(output))
+
+
+def main():
+    data = format_data(results)
+    parse_data(data)
+
+
+# Git-r-done!
+##############################################################################
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+###############################################################################
+# Description: 		Nagios/Opsview plugin that uses NRPE and check_ntp_time
+#			to provide a NTP offset monitoring solution that allows
+#			for one NTP host to be down and not create alerts.
+#			This facilitates $CLIENT's regular maintenance windows.
+# 			Why not use a different plugin?  There are a lot of
+#			plugins that almost do what is needed but then also
+#			would need to be installed on every linux system.  This
+#			provides a quick 'wrapper' solution that doesn't
+#			require plugin install/configuration.
+#			Note: I will not be offended if this is replaced later
+#			at the time of this development, there is no config
+#			management in place at $CLIENT to assist with this need.
+# Author: 		Bo Smith (bo@bosmith.tech)
+# Date:			2018-05-08
+###############################################################################
+import argparse
+import sys
+import pprint
+import os
+parser = argparse.ArgumentParser(
+    prog='check_linux_ntp',
+    usage='%(prog)s [-H] [-t]',
+    description='Plugin to check the NTP offset of 1 or more NTP servers')
+parser.add_argument('-H', '--hostname', action='store', required=True, metavar='',
+                    help='Hostname of the NTP Client linux server')
+parser.add_argument('-n', '--ntpserver', action='append', required=True, metavar='',
+                    help='NTP Server to check (Can be repeated)')
+parser.add_argument('-w', '--warning', action='store', type=float, required=False, metavar='',
+                    default=0.5, help='Warning threshold')
+parser.add_argument('-c', '--critical', action='store', type=float, required=False, metavar='',
+                    default=None, help='Critical threshold')
+args = parser.parse_args()
+hostname = args.hostname
+ntpserver = args.ntpserver
+warning = args.warning
+critical = args.critical
+cmd = '/opt/opsview/monitoringscripts/plugins/check_nrpe -P TLSv1 -H '
+warn = {}
+crit = {}
+ok = {}
+count = 0
+
+STATE_OK = 0
+STATE_WARNING = 1
+STATE_CRITICAL = 2
+STATE_UNKNOWN = 3
+status = {}
+
+# Get NTP stats
+###############################################################################
+
+
+def get_ntp_stats():
+    for i in ntpserver:
+        try:
+            stats = os.popen(cmd+hostname+' -c check_ntp_time -a \'-H '+i+'\'')
+            stats = stats.readline().strip()
+        except Exception as err:
+            print('UNKNOWN: '+str(err))
+            sys.exit(STATE_UNKNOWN)
+        if ('No response' in stats or 'unknown' in stats):
+            status[i] = 'No response'
+        else:
+            stats = stats.split(' ')[3]
+            status[i] = float(stats)
+    return(status)
+
+# Alert Functions
+###############################################################################
+
+
+def alert_crit(data):
+    print('CRITICAL: {}'.format(data))
+    sys.exit(STATE_CRITICAL)
+
+
+def alert_warn(data):
+    print('WARNING: {}'.format(data))
+    sys.exit(STATE_WARNING)
+
+
+def alert_ok(data):
+    print('OK: {}'.format(data))
+    sys.exit(STATE_OK)
+
+
+def alert_unknown(data):
+    print('UNKNOWN: {}'.format(data))
+    sys.exit(STATE_UNKNOWN)
+
+
+# Check for down NTP Servers
+###############################################################################
+# Rule, pass if at least 1 ntp server is responding, bail out and alert if not
+def check_down_ntp(status):
+    good = 0
+    for host, value in status.items():
+        if value != 'No response':
+            good += 1
+    if good == 0:
+        # Decide criticality of alert by what was defined in -w and -c
+        if critical:
+            alert_crit('No response from any NTP servers!')
+        else:
+            alert_warn('No response from any NTP servers!')
+    else:
+        parse_results(status)
+
+
+# Parse Results
+###############################################################################
+def parse_results(status):
+    perf_data = '| '
+    return_string = ''
+    for host, value in status.items():
+        # If a critical threshold is defined, start here
+        if critical:
+            # isinstance check for float ignore 'no response'
+            if (isinstance(value, float) and value >= critical):
+                crit[host] = value
+            elif (isinstance(value, float) and value >= warning):
+                warn[host] = value
+            else:
+                ok[host] = value
+        # If only a warning threshold is defined, start here
+        elif warning:
+            if (isinstance(value, float) and value >= warning):
+                warn[host] = value
+            else:
+                ok[host] = value
+        if value == 'No response':
+            perf_data += host+"=  "
+        else:
+            perf_data += host+"="+str(value)+" "
+
+    if len(crit) > 0:
+        for host, value in crit.items():
+            return_string += host+":"+str(value)+" "
+        if len(warn) > 0:
+            for host, value in warn.items():
+                return_string += host+":"+str(value)+" "
+        if len(ok) > 0:
+            for host, value in ok.items():
+                return_string += host+":"+str(value)+" "
+        alert_crit('{}{}'.format(return_string, perf_data))
+    if len(warn) > 0:
+        for host, value in warn.items():
+            return_string += host+":"+str(value)+" "
+        if len(ok) > 0:
+            for host, value in ok.items():
+                return_string += host+":"+str(value)+" "
+        alert_warn('{}{}'.format(return_string, perf_data))
+    if len(ok) > 0:
+        for host, value in ok.items():
+            return_string += host+":"+str(value)+" "
+        alert_ok('{}{}'.format(return_string, perf_data))
+
+
+# Main
+###############################################################################
+status = get_ntp_stats()
+all_down = check_down_ntp(status)

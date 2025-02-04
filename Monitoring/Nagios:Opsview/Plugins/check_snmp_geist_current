@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+######################################################################
+# Description:		Nagios/Opsview plugin to check current metrics
+#			grom a Geist pdu
+#
+# Author:		Bo Smith (bo@bosmith.tech)
+# Creation Date:	2017-09-25
+# Dependencies:	python-netsnmp, python-argparse, Geist mib
+######################################################################
+import netsnmp
+import sys
+import argparse
+
+# Nagios Variables
+STATE_OK = 0
+STATE_WARNING = 1
+STATE_CRITICAL = 2
+STATE_UNKNOWN = 3
+
+# Check Veriables
+temp = {}
+warn = 0
+crit = 0
+warn_low = 0
+warn_high = 0
+crit_low = 0
+crit_high = 0
+warning = False
+critical = False
+status_string = ''
+perf_string = ' | '
+name = ''
+current = ''
+
+# Parse arguments
+#####################################################################
+parser = argparse.ArgumentParser(
+    prog='check_snmp_geist_current',
+    description='Opsview plugin to monitor current on a Geist PDU',
+    usage='%(prog)s -H [host] -v [snmp version] -C [snmpcommunity string]')
+parser.add_argument('-H', '--host', action='store', required=True, metavar='',
+                    help='IP Address or hostname of the PDU')
+parser.add_argument('-v', '--version', action='store', required=True, metavar='',
+                    help='SNMP Version to use')
+parser.add_argument('-C', '--community', action='store', required=True, metavar='',
+                    help='SNMP Version 2 community string')
+parser.add_argument('-a', '--authproto', action='store', required=False, metavar='',
+                    help='SNMP Version 3 Authentication Protocol')
+parser.add_argument('-A', '--authkey', action='store', required=False, metavar='',
+                    help='SNMP Version 3 Authentication Key')
+parser.add_argument('-l', '--seclevel', action='store', default='AuthPriv', required=False, metavar='',
+                    help='SNMP Version 3 Security Level (Default \'AuthPriv\')')
+parser.add_argument('-x', '--privproto', action='store', required=False, metavar='',
+                    help='SNMP Version 3 Privacy Protocol')
+parser.add_argument('-X', '--privkey', action='store', required=False, metavar='',
+                    help='SNMP Version 3 Privacy Key')
+parser.add_argument('-u', '--secuser', action='store', required=False, metavar='',
+                    help='SNMP Version 3 Security User')
+parser.add_argument('-w', '--warning', action='store', required=False, metavar='',
+                    help='Warning threshold (optional)')
+parser.add_argument('-c', '--critical', action='store', required=False, metavar='',
+                    help='Critical threshold (optional)')
+
+# Assign argments to variables
+args = parser.parse_args()
+DestHost = args.host
+Version = args.version
+Community = args.community
+SecLevel = args.seclevel
+AuthProto = args.authproto
+AuthPass = args.authkey
+PrivProto = args.privproto
+PrivPass = args.privkey
+SecName = args.secuser
+warn = args.warning
+crit = args.critical
+
+# Check that all the arguments make sense
+if (Version == '2') or (Version == '2c'):
+    if Version == '2c':
+        Version = '2'
+    if Community == '':
+        print(
+            "Error: Version 2 requires a community string, see -h or --help for assistance")
+        sys.exit(3)
+    else:
+        session = netsnmp.Session(
+            DestHost=DestHost, Version=int(Version), Community=Community)
+if Version == '3':
+    if DestHost == '' or AuthProto == '' or AuthPass == '' or PrivProto == '' or PrivPass == '' or SecName == '':
+        print("Error: Version 3 requires AuthProto, AuthPass, PrivProto, PrivPass and SecName\nSee -h or --help for assistance")
+        sys.exit(3)
+    else:
+        AuthProto = AuthProto.upper()
+        PrivProto = PrivProto.upper()
+        session = netsnmp.Session(DestHost=DestHost, Version=int(Version), SecLevel=SecLevel,
+                                  AuthProto=AuthProto, AuthPass=AuthPass, PrivProto=PrivProto, PrivPass=PrivPass, SecName=SecName)
+
+# Test to make sure we can connect, if fail try up to 3x
+#####################################################################
+attempt = 0
+while attempt <= 3:
+    descr = session.get(netsnmp.VarList(
+        netsnmp.Varbind("SNMPv2-MIB::sysDescr.0")))
+    descr = descr[0]
+    if descr != None:
+        break
+    else:
+        attempt += 1
+
+if attempt == 3:
+    print('UNKNOWN: Unable to connect via SNMP')
+    sys.exit(STATE_UNKNOWN)
+
+# Perform SNMP call/s
+#####################################################################
+count = 0
+for i in session.walk(netsnmp.VarList(netsnmp.Varbind("GEIST-IMD-MIB::pduPhaseIndex"))):
+    t = i.decode()
+    try:
+        results = session.get(netsnmp.VarList(netsnmp.Varbind(
+            "GEIST-IMD-MIB::pduPhaseName", t), netsnmp.Varbind("GEIST-IMD-MIB::pduPhaseCurrent", t)))
+        name = results[0].decode()
+    except:
+        print('UNKNOWN - Unable to process the information from the PDU')
+        sys.exit(STATE_UNKNOWN)
+    if name:
+        name = name.replace(' ', '_')
+    try:
+        current = results[1].decode()
+        current = float(current)
+        current = current * .01
+    except Exception as e:
+        print('UNKNOWN: An issue occurred processing the values ' +
+              str(current)+' '+str(e))
+        sys.exit(STATE_UNKNOWN)
+
+    if crit:
+        if (current > 0) and (current >= float(crit)):
+            critical = True
+    elif warn:
+        if (current > 0) and (current >= float(warn)):
+            warning = True
+
+    status_string = status_string+' '+name+' Current:'+str(current)
+    if count > 0:
+        perf_string = perf_string+' '+name+'_current='+str(current)
+    else:
+        perf_string = perf_string+name+'_current='+str(current)
+    count += 1
+
+perf_string = perf_string.lower()
+
+if critical == True:
+    print('CRITICAL:'+status_string+perf_string)
+    sys.exit(STATE_CRITICAL)
+elif warning == True:
+    print('WARNING:'+status_string+perf_string)
+    sys.exit(STATE_WARNING)
+elif current == '':
+    print('UNKNOWN: Unable to get current')
+    sys.exit(STATE_UNKNOWN)
+else:
+    print('OK:'+status_string+perf_string)
+    sys.exit(STATE_OK)

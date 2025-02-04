@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+##############################################################################
+'''
+Description:	Opsview/Nagios plugin used to monitor linux disk statistics 
+                via ssh
+Requirements:	Requires a username/password or username/ssh key
+Created:	    2019-08-12
+Author:		    Bo Smith (bo@bosmith.tech)
+'''
+##############################################################################
+import argparse
+import io
+import paramiko
+import pprint
+import re
+import sys
+
+ok = 0
+warn = 1
+crit = 2
+unknown = 3
+cmd = 'cat /proc/diskstats'
+partre = re.compile(r'\d')
+
+
+# Get arguments
+##############################################################################
+def get_args():
+    parser = argparse.ArgumentParser(
+        usage='%(prog)s [-H] [-u] [-p]',
+        description='Opsview plugin to remotely monitor Linux disk usage via SSH')
+    parser.add_argument(
+        '-H',
+        '--host',
+        action='store',
+        required=True,
+        help='Host name or IP address'
+    )
+    parser.add_argument(
+        '-s',
+        '--sshkey',
+        action='store',
+        default='',
+        required=False,
+        help='Path to SSH Key file'
+    )
+    parser.add_argument(
+        '-ss',
+        '--sshkeystring',
+        action='store',
+        default='',
+        required=False,
+        help='SSH Key as String'
+    )
+    parser.add_argument(
+        '-u',
+        '--username',
+        action='store',
+        required=True,
+        help='Username to SSH to the appliance (Assumed \'opsview\' if blank'
+    )
+    parser.add_argument(
+        '-p',
+        '--password',
+        action='store',
+        default='',
+        required=False,
+        help='Password for the user'
+    )
+    parser.add_argument(
+        '-P',
+        '--port',
+        action='store',
+        required=False,
+        default=22,
+        type=int,
+        help='SSH Port to use (Default 22)'
+    )
+    parser.add_argument(
+        '-t',
+        '--timeout',
+        action='store',
+        required=False,
+        default=15,
+        type=int,
+        help='Timeout in Seconds to wait for an SSH connection (default 15)'
+    )
+    parser.add_argument(
+        '-w',
+        '--warning',
+        action='store',
+        required=False,
+        type=float,
+        help='Warning threshold in percentage'
+    )
+    parser.add_argument(
+        '-c',
+        '--critical',
+        action='store',
+        required=False,
+        type=float,
+        help='Critical threshold in percentage'
+    )
+    args = parser.parse_args()
+    if (args.username == None and
+        args.sshkey == None and
+            args.sshkeystring == None):
+        print("Either a username and password combination or ssh key is required")
+        print(parser.print_help())
+        sys.exit(unknown)
+    return(args)
+
+
+# Setup and create Paramiko connection object
+##############################################################################
+def setup_ssh(args):
+    try:
+        # Prep client
+        client = paramiko.SSHClient()
+        client.load_system_host_keys()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        # Build kwargs used to setup ssh connection
+        clientargs = {
+            'banner_timeout': args.timeout,
+            'timeout': args.timeout,
+            'password': args.password,
+            'port': args.port,
+            'username': args.username
+        }
+        # Add ssh key from file if provided as file path
+        if args.sshkey:
+            clientargs['key_filename'] = args.sshkey
+        # Add ssh key from string if provided as string
+        elif args.sshkeystring:
+            s = io.StringIO(args.sshkeystring.replace('\\n', '\n'))
+            opsvkey = paramiko.RSAKey.from_private_key(
+                s,
+                password=args.password
+            )
+            clientargs['pkey'] = opsvkey
+        # Setup Connection
+        client.connect(args.host, **clientargs)
+    except paramiko.AuthenticationException as err:
+        message = 'Authentication failed '+str(err)
+        send_unknown(message)
+    except paramiko.SSHException as err:
+        message = 'Unable to establish SSH connection '+str(err)
+        send_unknown(message)
+    except IOError as err:
+        message = 'Timed Out attempting SSH connection'
+        send_unknown(message)
+    except Exception as err:
+        message = 'Unable to establish SSH connection '+str(err)
+        send_unknown(message)
+    return(client)
+
+
+# Gather the Metrics
+##############################################################################
+def get_usage(client, cmd, args):
+    results = []
+    cmd = cmd
+    try:
+        stdin, stdout, stderr = client.exec_command(cmd, get_pty=True)
+    except Exception as err:
+        send_unknown(str(err))
+    try:
+        data = stdout.readlines()
+        # CA-594: Add logic to strip first output line if it's "/usr/bin/id: cannot find name for group ID"
+        # This is to handle unpredictable addition of extra output for OSLogin hosts in GCP
+        if 'id: cannot find name' in data[0]:
+            del data[0]
+
+        for line in data:
+            tmp = {}
+            line = line.strip()
+            device_name = line.split()[2]
+            if partre.search(device_name):
+                if ('ram' not in device_name and 'loop' not in device_name):
+                    tmp['device_name'] = line.split()[2]
+                    tmp['reads_completed'] = line.split()[3]
+                    tmp['reads_merged'] = line.split()[4]
+                    tmp['sectors_read'] = line.split()[5]
+                    tmp['time_spent_reading'] = line.split()[6]
+                    tmp['writes_completed'] = line.split()[7]
+                    tmp['writes_merged'] = line.split()[8]
+                    tmp['sectors_written'] = line.split()[9]
+                    tmp['time_spent_writing'] = line.split()[10]
+                    tmp['ios_currently_in_progress'] = line.split()[11]
+                    tmp['time_spent_doing_ios'] = line.split()[12]
+                    tmp['weighted_time_spent_doing_ios'] = line.split()[13]
+                    results.append(tmp)
+    except Exception as err:
+        send_unknown("problem reading data from server "+str(err))
+    return(results)
+
+
+# Process Stats
+##############################################################################
+def process_stats(stats, args):
+    message = ''
+    perf_data = '| '
+    count = 0
+    for stat in stats:
+        message += 'Device Name: {} Reads: {} Writes: {} '.format(
+            stat['device_name'],
+            stat['reads_completed'],
+            stat['writes_completed'],
+        )
+        if count == 0:
+            perf_data += '{}_reads={}, {}_writes={}'.format(
+                stat['device_name'],
+                stat['reads_completed'],
+                stat['device_name'],
+                stat['writes_completed'],
+            )
+        else:
+            perf_data += ', {}_reads={}, {}_writes={}'.format(
+                stat['device_name'],
+                stat['reads_completed'],
+                stat['device_name'],
+                stat['writes_completed'],
+            )
+        count += 1
+    message += perf_data
+    # If we want both Critical and Warning alerts
+    if args.critical and args.warning:
+        if stats['usedpct'] >= args.critical:
+            send_critical(message)
+        elif stats['usedpct'] >= args.warning:
+            send_warning(message)
+        else:
+            send_ok(message)
+    # If we just want critical alerts
+    elif args.critical:
+        if stats['usedpct'] >= args.critical:
+            send_critical(message)
+        else:
+            send_ok(message)
+    # If we just want warning alerts
+    elif args.warning:
+        if stats['usedpct'] >= args.warning:
+            send_warning(message)
+        else:
+            send_ok(message)
+    # If we only want to gather the metrics and not alert
+    else:
+        send_ok(message)
+
+
+# Alert Functions
+##############################################################################
+def send_warning(message):
+    print('WARNING - '+message)
+    sys.exit(warn)
+
+
+def send_critical(message):
+    print('CRITICAL - '+message)
+    sys.exit(crit)
+
+
+def send_ok(message):
+    print('OK - '+message)
+    sys.exit(ok)
+
+
+def send_unknown(message):
+    print('UNKNOWN - '+message)
+    sys.exit(unknown)
+
+
+# Git-r-done!
+##############################################################################
+def main():
+    args = get_args()
+    client = setup_ssh(args)
+    stats = get_usage(client, cmd, args)
+    client.close()
+    process_stats(stats, args)
+
+
+if __name__ == "__main__":
+    main()

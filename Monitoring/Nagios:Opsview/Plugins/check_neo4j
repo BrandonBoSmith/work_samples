@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+###############################################################################
+'''
+Description:    Opsview plugin to monitor Neo4j
+Author:         Bo Smith (bo@bosmith.tech)
+Date:           2019-12-19
+'''
+###############################################################################
+
+import argparse
+import json
+import operator
+import pprint
+import requests
+import sys
+
+# Alert vars
+ok = 0
+warn = 1
+crit = 2
+unknown = 3
+
+
+# Get Arguments
+###############################################################################
+def get_args():
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description='Opsview plugin for monitoring Neo4j\n'
+        '\tCurrently does not supported authenticated installations'
+    )
+    metric = parser.add_argument_group('metric options')
+    neohost = parser.add_argument_group('host options')
+    threshold = parser.add_argument_group('threshold options')
+    neohost.add_argument(
+        '-H',
+        '--host',
+        action='store',
+        required=True,
+        help='Host name or IP address of the Neo4j instance'
+    )
+    neohost.add_argument(
+        '-P',
+        '--port',
+        action='store',
+        required=False,
+        default='7474',
+        help='Neo4j port, default is 7474'
+    )
+    metric.add_argument(
+        '--metric',
+        action='store',
+        choices=['stats', 'stores'],
+        required=True,
+        help='Metric to gather'
+    )
+    metric.add_argument(
+        '--storeattribute',
+        action='store',
+        choices=[
+            'ArrayStoreSize',
+            'LogicalLogSize',
+            'NodeStoreSize',
+            'PropertyStoreSize',
+            'RelationshipStoreSize',
+            'StringStoreSize',
+            'TotalStoreSize',
+        ],
+        help='Attribute to check for the given metric'
+    )
+    metric.add_argument(
+        '--statsattribute',
+        action='store',
+        choices=[
+            'NumberOfRelationshipTypeIdsInUse',
+            'NumberOfNodeIdsInUse',
+            'NumberOfRelationshipIdsInUse',
+            'NumberOfPropertyIdsInUse'
+        ],
+        help='Attribute to check for the given metric'
+    )
+    threshold.add_argument(
+        '-C',
+        '--comparison',
+        action='store',
+        required=False,
+        choices=['gt', 'lt'],
+        default='gt',
+        help='Comparison operator to use. Use gt to alert for values greater\n'
+             'than the threshold or lt to alert for values lesser than.\n'
+             'Default is gt.',
+    )
+    threshold.add_argument(
+        '-w',
+        '--warning',
+        action='store',
+        required=False,
+        type=int,
+        help='Warning theshold'
+    )
+    threshold.add_argument(
+        '-c',
+        '--critical',
+        action='store',
+        required=False,
+        type=int,
+        help='Warning theshold'
+    )
+    args = parser.parse_args()
+    return(args)
+
+
+# Get Stats
+##############################################################################
+def get_stats(args):
+    url = 'http://'+args.host+':'+args.port+'/db/manage/server/jmx/domain/'
+    url += 'org.neo4j/instance%3Dkernel%230%2Cname%3DPrimitive%20count'
+    try:
+        s = requests.get(
+            url,
+            headers=({'content-type': 'application/json'})
+        )
+        s.raise_for_status()
+    except Exception as err:
+        send_unknown(str(err))
+    for stat in s.json()[0]['attributes']:
+        if stat['name'] == args.statsattribute:
+            metric = stat['name']
+            value = stat['value']
+            check_threshold(args, metric, int(value))
+
+
+# Get Stores
+##############################################################################
+def get_stores(args):
+    url = 'http://'+args.host+':'+args.port+'/db/manage/server/jmx/domain/'
+    url += 'org.neo4j/instance%3Dkernel%230%2Cname%3DStore%20file%20sizes'
+    try:
+        s = requests.get(
+            url,
+            headers=({'content-type': 'application/json'})
+        )
+        s.raise_for_status()
+    except Exception as err:
+        send_unknown(str(err))
+    for store in s.json()[0]['attributes']:
+        if store['name'] == args.storeattribute:
+            metric = store['name']
+            value = store['value']
+            check_threshold(args, metric, int(value))
+
+
+# Check Threshold
+##############################################################################
+def check_threshold(args, metric, value):
+    message = metric+' '+str(value)
+    message += ' | '+metric+'='+str(value)
+
+    if args.comparison == 'gt':
+        comp = operator.gt
+    if args.comparison == 'lt':
+        comp = operator.lt
+
+    # If both warning and critical arguments supplied
+    if args.warning and args.critical:
+        if comp(value, args.critical):
+            send_critical(message)
+        elif comp(value, args.warning):
+            send_warning(message)
+        else:
+            send_ok(message)
+    # If only critical argument supplied
+    elif args.critical:
+        if comp(value, args.critical):
+            send_critical(message)
+        else:
+            send_ok(message)
+    # If only warning argument supplied
+    elif args.warning:
+        if comp(value, args.warning):
+            send_warning(message)
+        else:
+            send_ok(message)
+    else:
+        send_ok(message)
+
+
+# Alert Functions
+##############################################################################
+def send_warning(message):
+    print('WARNING - '+str(message))
+    sys.exit(warn)
+
+
+def send_critical(message):
+    print('CRITICAL - '+str(message))
+    sys.exit(crit)
+
+
+def send_ok(message):
+    print('OK - '+str(message))
+    sys.exit(ok)
+
+
+def send_unknown(message):
+    print('UNKNOWN - '+str(message))
+    sys.exit(unknown)
+
+
+# Main
+###############################################################################
+def main():
+    args = get_args()
+    globals()['get_'+args.metric](args)
+
+
+if __name__ == '__main__':
+    main()

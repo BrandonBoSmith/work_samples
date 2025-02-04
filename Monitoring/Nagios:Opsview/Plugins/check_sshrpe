@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+###############################################################################
+'''
+Description:    Opsview monitoring plugin that executes an exising Nagios 
+                plugin over SSH.  This works by first establissing an SSH
+                tunnel, then checks for a plugin directory, checks for the
+                plugin, checks that the plugin is the right version, then 
+                copies over the plugin if it is missing or the wrong version. 
+                After which it then executes the plugin with the supplied 
+                arguments.
+
+Date:           2020-1-16
+Author:         Bo Smith (bo@bosmith.tech)
+'''
+###############################################################################
+
+import argparse
+import io
+import paramiko
+import subprocess
+import sys
+
+ok = 0
+warn = 1
+crit = 2
+unknown = 3
+
+
+# Get Arguments
+###############################################################################
+def get_args():
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="Monitoring plugin that executes a Nagios pugin over ssh\n"
+                    "and evaluates the result.\n\n"
+                    "This is accomplished by maintaining a local copy of the\n"
+                    "plugin on the target host."
+    )
+    required = parser.add_argument_group('required options')
+    plugin = parser.add_argument_group('plugin options')
+    optional = parser.add_argument_group('optional options')
+    # Required options
+    required.add_argument(
+        '-H',
+        '--host',
+        action='store',
+        required=True,
+        help='Hostname or IP address'
+    )
+    required.add_argument(
+        '-u',
+        '--username',
+        action='store',
+        default='',
+        required=True,
+        help='Username to SSH to the appliance (Assumed \'opsview\' if blank'
+    )
+    required.add_argument(
+        '-s',
+        '--sshkey',
+        action='store',
+        default='',
+        required=False,
+        help='SSH Key (Preferred over password)'
+    )
+    parser.add_argument(
+        '-ss',
+        '--sshkeystring',
+        action='store',
+        default='',
+        required=False,
+        help='SSH Key as String'
+    )
+    required.add_argument(
+        '-p',
+        '--password',
+        action='store',
+        default='',
+        required=False,
+        help='Password for the user (Only used if sshkey is not provided)'
+    )
+    optional.add_argument(
+        '-P',
+        '--port',
+        action='store',
+        required=False,
+        default=22,
+        type=int,
+        help='SSH Port to use (Default 22)'
+    )
+    optional.add_argument(
+        '-t',
+        '--timeout',
+        action='store',
+        required=False,
+        default=15,
+        type=int,
+        help='Timeout in Seconds to wait for an SSH connection (default 15)'
+    )
+    # Plugin options
+    plugin.add_argument(
+        '-D',
+        '--homedirectory',
+        action='store',
+        required=False,
+        default=None,
+        help='Home directory of the user connecting to the target host\n'
+             'This defaults to /home/[USERNAME] if not provided'
+    )
+    plugin.add_argument(
+        '-N',
+        '--plugin',
+        action='store',
+        required=True,
+        help='Name of the nagios plugin to use'
+    )
+    plugin.add_argument(
+        '-A',
+        '--arguments',
+        action='store',
+        required=True,
+        help='Arguments for the specific nagios plugin'
+    )
+    plugin.add_argument(
+        '-S',
+        '--sudo',
+        action='store_true',
+        required=False,
+        default=False,
+        help='Execute with sudo'
+    )
+    args = parser.parse_args()
+    return(args)
+
+
+# Setup and create Paramiko connection object
+##############################################################################
+def setup_ssh(args):
+    try:
+        # Prep client
+        client = paramiko.SSHClient()
+        client.load_system_host_keys()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        # Build kwargs used to setup ssh connection
+        clientargs = {
+            'banner_timeout': args.timeout,
+            'timeout': args.timeout,
+            'password': args.password,
+            'port': args.port,
+            'username': args.username
+        }
+        # Add ssh key from file if provided as file path
+        if args.sshkey:
+            clientargs['key_filename'] = args.sshkey
+        # Add ssh key from string if provided as string
+        elif args.sshkeystring:
+            s = io.StringIO(args.sshkeystring.replace('\\n', '\n'))
+            opsvkey = paramiko.RSAKey.from_private_key(
+                s,
+                password=args.password
+            )
+            clientargs['pkey'] = opsvkey
+        # Setup Connection
+        client.connect(args.host, **clientargs)
+    except paramiko.AuthenticationException as err:
+        message = str(err)
+        send_unknown(message)
+    except paramiko.SSHException as err:
+        message = 'Unable to establish SSH connection '+str(err)
+        send_unknown(message)
+    except IOError as err:
+        message = 'Timed Out attempting SSH connection '+str(err)
+        send_unknown(message)
+    except Exception as err:
+        message = 'Unable to establish SSH connection '+str(err)
+        send_unknown(message)
+    return(client)
+
+
+# Check for the plugin directory and plugin
+##############################################################################
+def check_plugin(client, home, args):
+    # Check for and create plugin directory if it doesn't exist
+    try:
+        stdin, stdout, stderr = client.exec_command(
+            'mkdir -p '+home+'/.monitoring_plugins',
+            get_pty=True
+        )
+    except Exception as err:
+        message = 'Unable to create monitoring_plugins directory'
+        send_unknown(message)
+
+    # Check for the plugin, if it does not exist copy over and make execuatble
+    sftp = client.open_sftp()
+    try:
+        sftp.chdir("{}/.monitoring_plugins/".format(home))
+        sftp.stat(args.plugin)
+
+        # Get source md5 fingerprint
+        src_md5 = subprocess.check_output(
+            'md5sum /opt/opsview/monitoringscripts/plugins/'+args.plugin,
+            stderr=subprocess.STDOUT,
+            shell=True
+        ).split()[0]
+
+        # Get client md5 fingerprint
+        stdin, stdout, stderr = client.exec_command(
+            'md5sum {}/.monitoring_plugins/{}'.format(home, args.plugin)
+        )
+        dst_md5 = stdout.read().split()[0]
+
+        # Compare fingerprints and replace if different
+        if src_md5 != dst_md5:
+            sftp.put(
+                '/opt/opsview/monitoringscripts/plugins/{}'.format(
+                    args.plugin),
+                '{}/.monitoring_plugins/{}'.format(home, args.plugin)
+            )
+            sftp.chmod(home+'/.monitoring_plugins/'+args.plugin, 0o770)
+    except Exception as err:
+        try:
+            sftp.put(
+                '/opt/opsview/monitoringscripts/plugins/{}'.format(
+                    args.plugin),
+                '{}/.monitoring_plugins/{}'.format(home, args.plugin)
+            )
+            sftp.chmod(home+'/.monitoring_plugins/'+args.plugin, 0o770)
+        except Exception as err:
+            send_unknown('Problem copying plugin {} {}'.format(
+                args.plugin, str(err)))
+
+    # Check for utils.sh scripts, copy if missing
+    try:
+        sftp.stat("{}/.monitoring_plugins/utils.sh".format(home))
+    except Exception as err:
+        try:
+            sftp.put(
+                '/opt/opsview/monitoringscripts/plugins/utils.sh',
+                '{}/.monitoring_plugins/utils.sh'.format(home)
+            )
+            sftp.chmod(home+'/.monitoring_plugins/'+args.plugin, 0o770)
+        except Exception as err:
+            send_unknown('Problem copying utils.sh '+str(err))
+
+    # Check for utils.pm scripts, copy if missing
+    try:
+        sftp.stat("{}/.monitoring_plugins/utils.pm".format(home))
+    except Exception as err:
+        try:
+            sftp.put(
+                '/opt/opsview/monitoringscripts/plugins/utils.pm',
+                '{}/.monitoring_plugins/utils.pm'.format(home)
+            )
+            sftp.chmod(home+'/.monitoring_plugins/'+args.plugin, 0o770)
+        except Exception as err:
+            send_unknown('Problem copying utils.pm '+str(err))
+    sftp.close()
+
+
+# Alert Functions
+##############################################################################
+def send_unknown(message):
+    print('UNKNOWN - '+str(message))
+    sys.exit(unknown)
+
+
+# Run the Command
+##############################################################################
+def execute_plugin(client, home, args):
+    results = {}
+    if args.sudo:
+        cmd = 'sudo {}/.monitoring_plugins/{} {}'.format(
+            home, args.plugin, args.arguments
+        )
+    else:
+        cmd = '{}/.monitoring_plugins/{} {}'.format(
+            home, args.plugin, args.arguments
+        )
+    try:
+        stdin, stdout, stderr = client.exec_command(
+            cmd,
+            get_pty=True
+        )
+        return_code = stdout.channel.recv_exit_status()
+        results['output'] = stdout.read().strip()
+        results['return_code'] = return_code
+    except Exception as err:
+        send_unknown(str(err))
+    return(results)
+
+
+# Main
+###############################################################################
+def main():
+    args = get_args()
+    # Setup Home Dir
+    if args.homedirectory == None:
+        home = '/home/'+args.username
+    else:
+        home = args.homedirectory
+    client = setup_ssh(args)
+    plugin_exist = check_plugin(client, home, args)
+    result = execute_plugin(client, home, args)
+
+    # Decode if bytes encoded.  Seems to happen since moving to python3
+    try:
+        result['output'] = result['output'].decode('UTF-8')
+    except:
+        pass
+    print(str(result['output']))
+    sys.exit(result['return_code'])
+    client.close()
+
+
+if __name__ == '__main__':
+    main()

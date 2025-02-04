@@ -1,0 +1,529 @@
+#!/usr/bin/env python3
+###############################################################################
+'''
+Description:    Opsview plugin that monitors SFTP sites and verifies proper
+                functionality.
+Date:           2021-6-18
+Author:         Bo Smith (bo@bosmith.tech)
+'''
+###############################################################################
+
+import argparse
+import io
+import paramiko
+import pprint
+import subprocess
+import sys
+import nagiosplugin
+import logging
+import stat
+from enum import Enum
+from io import StringIO
+
+logger = logging.getLogger(__name__)
+
+
+class PERMISSIONS(Enum):
+
+    WRITE = "w"
+    READ = "r"
+    EXECUTE = "x"
+
+    def __str__(self):
+        return self.value
+
+    def __repr__(self):
+        return self.value
+
+
+class CheckSFTPLogin(nagiosplugin.Resource):
+
+    def __init__(self, options):
+        self.options = options
+
+    def _login(self):
+        try:
+            self.client = paramiko.SSHClient()
+            self.client.load_system_host_keys()
+            self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            clientargs = {
+                'banner_timeout': self.options['timeout'],
+                'timeout': self.options['timeout'],
+                'password': self.options['password'],
+                'port': self.options['port'],
+                'username': self.options['username']
+            }
+            if self.options['sshkey']:
+                clientargs['key_filename'] = self.options['sshkey']
+            elif self.options['sshkeystring']:
+                s = StringIO(self.options['sshkeystring'].replace('\\n', '\n'))
+                opsvkey = paramiko.RSAKey.from_private_key(
+                    s,
+                    password=self.options['password']
+                )
+                clientargs['pkey'] = opsvkey
+            self.client.connect(self.options['host'], **clientargs)
+            self.sftp = self.client.open_sftp()
+            return {"error": None}
+        except Exception as err:
+            return {"error": err}
+
+    def probe(self):
+        result = self._login()
+        yield nagiosplugin.Metric('login_status', {"error": result['error']}, context='login')
+
+class CheckSFTPLoginContext(nagiosplugin.Context):
+
+    def __init__(self, **kwargs):
+        super().__init__(name=kwargs["name"])
+        self.warning_flag = kwargs["warning_flag"]
+        self.critical_flag = kwargs["critical_flag"]
+
+    def evaluate(self, metric, resource):
+        logger.debug('Evaluating Metric: {} with value {}'.format(
+            metric.name, metric.value))
+        result = metric.value
+        error = result['error']
+        if error:
+            hint = 'Login error is: {}'.format(error)
+        else:
+            hint = 'Login Succesfully'
+        if self.critical_flag:
+            if error:
+                return self.result_cls(nagiosplugin.state.Critical, hint, metric)
+            else:
+                return self.result_cls(nagiosplugin.state.Ok, hint, metric)
+        elif self.warning_flag:
+            if error:
+                return self.result_cls(nagiosplugin.state.Warn, hint, metric)
+            else:
+                return self.result_cls(nagiosplugin.state.Ok, hint, metric)
+        else:
+            return self.result_cls(nagiosplugin.state.Ok, hint, metric)
+
+
+class CheckSFTP(nagiosplugin.Resource):
+
+    def __init__(self, options):
+        self.options = options
+
+    def _connect_session(self):
+        try:
+            self.client = paramiko.SSHClient()
+            self.client.load_system_host_keys()
+            self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            clientargs = {
+                'banner_timeout': self.options['timeout'],
+                'timeout': self.options['timeout'],
+                'password': self.options['password'],
+                'port': self.options['port'],
+                'username': self.options['username']
+            }
+            if self.options['sshkey']:
+                clientargs['key_filename'] = self.options['sshkey']
+            elif self.options['sshkeystring']:
+                s = StringIO(self.options['sshkeystring'].replace('\\n', '\n'))
+                opsvkey = paramiko.RSAKey.from_private_key(
+                    s,
+                    password=self.options['password']
+                )
+                clientargs['pkey'] = opsvkey
+            self.client.connect(self.options['host'], **clientargs)
+        except Exception as err:
+            raise nagiosplugin.CheckError("Unable to login. Error: {}".format(err))
+
+    def _find(self, string, type):
+        try:
+            if type == PERMISSIONS.WRITE:
+                if PERMISSIONS.WRITE.value in string:
+                    return True
+                else:
+                    return False
+            if type == PERMISSIONS.READ:
+                if PERMISSIONS.READ.value in string:
+                    return True
+                else:
+                    return False
+
+        except Exception as err:
+            print(err)
+
+    def _read_perimssions(self, permissions):
+        try:
+            owner = permissions[1:4]
+            group = permissions[4:7]
+            other = permissions[7:10]
+            owner_read_permissions = self._find(owner, PERMISSIONS.READ)
+            group_read_permissions = self._find(group, PERMISSIONS.READ)
+            other_read_permissions = self._find(other, PERMISSIONS.READ)
+            return {"owner": {"read": owner_read_permissions}, "group": {"read": group_read_permissions}, "other": {"read": other_read_permissions}}
+        except Exception as err:
+            print(err)
+
+    def _write_perimssions(self, permissions):
+        try:
+            owner = permissions[1:4]
+            group = permissions[4:7]
+            other = permissions[7:10]
+            owner_write_permissions = self._find(owner, PERMISSIONS.WRITE)
+            group_write_permissions = self._find(group, PERMISSIONS.WRITE)
+            other_write_permissions = self._find(other, PERMISSIONS.WRITE)
+            return {"owner": {"write": owner_write_permissions}, "group": {"write": group_write_permissions}, "other": {"write": other_write_permissions}}
+        except Exception as err:
+            print(err)
+
+    def _convert_bits_to_mode(self, bits):
+        try:
+            return stat.filemode(bits)
+        except Exception as e:
+            print(e)
+
+    def _open_sftp(self):
+        try:
+            self.sftp = self.client.open_sftp()
+        except Exception as err:
+            print(err)
+
+    def _check_file(self):
+        try:
+            self.sftp.stat(self.options['file'])
+            return True
+        except Exception as err:
+            return False
+
+    def _check_read_permissions(self):
+        try:
+            dir_stat = self.sftp.stat(self.options['read'])
+            mode = self._convert_bits_to_mode(dir_stat.st_mode)
+            permissions = self._read_perimssions(mode, PERMISSIONS.READ)
+            return permissions
+        except Exception as err:
+            print(err)
+
+    def _check_write_permissions(self):
+        try:
+            dir_stat = self.sftp.stat(self.options['write'])
+            mode = self._convert_bits_to_mode(dir_stat.st_mode)
+            permissions = self._write_perimssions(mode, PERMISSIONS.WRITE)
+            return permissions
+        except Exception as err:
+            print(err)
+
+    def _check_dir(self):
+        try:
+            files = self.sftp.listdir(self.options['dir'])
+            return files
+        except Exception as err:
+            print(err)
+
+    def probe(self):
+        self._connect_session()
+        self._open_sftp()
+
+        if self.options['file']:
+            exist = self._check_file()
+            yield nagiosplugin.Metric('exists', exist, context='exists')
+
+        if self.options['dir']:
+            files = self._check_dir()
+            yield nagiosplugin.Metric("directory_files", files, context="directory_files")
+
+        if self.options['write']:
+            permissions = self._check_write_permissions()
+            yield nagiosplugin.Metric('write_permissions', permissions, context='permissions')
+
+        if self.options['read']:
+            permissions = self._check_read_permissions()
+            yield nagiosplugin.Metric('read_permissions', permissions, context='permissions')
+
+
+
+class CheckSFTPFileContext(nagiosplugin.Context):
+
+    def __init__(self, **kwargs):
+        super().__init__(name=kwargs["name"])
+        self.warning_flag = kwargs["warning_flag"]
+        self.critical_flag = kwargs["critical_flag"]
+
+    def evaluate(self, metric, resource):
+        logger.debug('Evaluating Metric: {} with value {}'.format(
+            metric.name, metric.value))
+
+        value = metric.value
+        hint = 'File dection is {}'.format(value)
+        if self.critical_flag:
+            if not value:
+                return self.result_cls(nagiosplugin.state.Critical, hint, metric)
+            else:
+                return self.result_cls(nagiosplugin.state.Ok, hint, metric)
+        elif self.warning_flag:
+            if not value:
+                return self.result_cls(nagiosplugin.state.Warn, hint, metric)
+            else:
+                return self.result_cls(nagiosplugin.state.Ok, hint, metric)
+        else:
+            return self.result_cls(nagiosplugin.state.Ok, hint, metric)
+
+
+class CheckSFTPDirFileContext(nagiosplugin.Context):
+
+    def __init__(self, **kwargs):
+        super().__init__(name=kwargs["name"])
+        self.warning_flag = kwargs["warning_flag"]
+        self.critical_flag = kwargs["critical_flag"]
+
+    def evaluate(self, metric, resource):
+        logger.debug('Evaluating Metric: {} with value {}'.format(
+            metric.name, metric.value))
+
+        value = metric.value
+        hint = 'Files contained in directory {}'.format(value)
+        if self.critical_flag:
+            if not value:
+                return self.result_cls(nagiosplugin.state.Critical, hint, metric)
+            else:
+                return self.result_cls(nagiosplugin.state.Ok, hint, metric)
+        elif self.warning_flag:
+            if not value:
+                return self.result_cls(nagiosplugin.state.Warn, hint, metric)
+            else:
+                return self.result_cls(nagiosplugin.state.Ok, hint, metric)
+        else:
+            return self.result_cls(nagiosplugin.state.Ok, hint, metric)
+
+class CheckSFTPPermissionsContext(nagiosplugin.Context):
+
+    def __init__(self, **kwargs):
+        super().__init__(name=kwargs["name"])
+        self.warning_flag = kwargs["warning_flag"]
+        self.critical_flag = kwargs["critical_flag"]
+
+        self.owner_flag = kwargs["owner_flag"]
+        self.group_flag = kwargs["group_flag"]
+        self.other_flag = kwargs["other_flag"]
+
+    def _calc_status(self, metric):
+        try:
+            if self.owner_flag:
+                return list(metric.value['owner'].values())[0]
+            elif self.group_flag:
+                return list(metric.value['group'].values())[0]
+            elif self.other_flag:
+                return list(metric.value['other'].values())[0]
+        except Exception as err:
+            print(err)
+
+    def evaluate(self, metric, resource):
+        logger.debug('Evaluating Metric: {} with value {}'.format(
+            metric.name, metric.value))
+        value = self._calc_status(metric)
+        hint = '{} is {}'.format(metric.name, value)
+        if self.critical_flag:
+            if not value:
+                return self.result_cls(nagiosplugin.state.Critical, hint, metric)
+            else:
+                return self.result_cls(nagiosplugin.state.Ok, hint, metric)
+        elif self.warning_flag:
+            if not value:
+                return self.result_cls(nagiosplugin.state.Warn, hint, metric)
+            else:
+                return self.result_cls(nagiosplugin.state.Ok, hint, metric)
+        else:
+            return self.result_cls(nagiosplugin.state.Ok, hint, metric)
+
+# Get Arguments
+###############################################################################
+
+
+def get_args():
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="Monitoring plugin that executes a Nagios pugin over ssh\n"
+                    "and evaluates the result.\n\n"
+                    "This is accomplished by maintaining a local copy of the\n"
+                    "plugin on the target host."
+    )
+    required = parser.add_argument_group('required options')
+    plugin = parser.add_argument_group('plugin options')
+    optional = parser.add_argument_group('optional options')
+    # Required options
+    plugin.add_argument(
+        '-f',
+        '--file',
+        action='store',
+        required=False,
+        help='Check for the existance of a file on the SFTP server'
+    )
+    plugin.add_argument(
+        '-d',
+        '--dir',
+        action='store',
+        required=False,
+        help='List a directory on the SFTP server'
+    )
+    plugin.add_argument(
+        '-r',
+        '--read',
+        action='store',
+        required=False,
+        help='Check for the ability to read a directory'
+    )
+    plugin.add_argument(
+        '-w',
+        '--write',
+        action='store',
+        required=False,
+        help='Check for the ability to write to a directory'
+    )
+    plugin.add_argument(
+        '-l',
+        '--login-only',
+        action='store_true',
+        required=False,
+        dest="login_only",
+        help='Check for the ability to login as the user, this will only test if the user is able to login successfully'
+    )
+    required.add_argument(
+        '-H',
+        '--host',
+        action='store',
+        required=True,
+        help='Hostname or IP address'
+    )
+    required.add_argument(
+        '-u',
+        '--username',
+        action='store',
+        default='',
+        required=True,
+        help='Username to SSH to the appliance (Assumed \'opsview\' if blank'
+    )
+    required.add_argument(
+        '-s',
+        '--sshkey',
+        action='store',
+        default='',
+        required=False,
+        help='SSH Key (Preferred over password)'
+    )
+    required.add_argument(
+        '-ss',
+        '--sshkeystring',
+        action='store',
+        default='',
+        required=False,
+        help='SSH Key as String'
+    )
+    required.add_argument(
+        '-p',
+        '--password',
+        action='store',
+        default='',
+        required=False,
+        help='Password for the user (Only used if sshkey is not provided)'
+    )
+    required.add_argument(
+        '-o',
+        '--owner',
+        dest="owner_flag",
+        action='store_true',
+        help="Add this flag to check owner permissions"
+    )
+    required.add_argument(
+        '-g',
+        '--group',
+        dest="group_flag",
+        action='store_true',
+        help="Add this flag to check group permissions"
+    )
+    required.add_argument(
+        '-ot',
+        '--other',
+        dest="other_flag",
+        action='store_true',
+        help="Add this flag to check other permissions"
+    )
+    required.add_argument(
+        '-wf',
+        '--warning_flag',
+        action='store_true',
+        help="Add this flag to generate a warning status"
+    )
+    required.add_argument(
+        '-cf',
+        '--critical_flag',
+        action='store_true',
+        help="Add this flag to generate a critical status"
+    )
+    optional.add_argument(
+        '-P',
+        '--port',
+        action='store',
+        required=False,
+        default=22,
+        type=int,
+        help='SSH Port to use (Default 22)'
+    )
+    optional.add_argument(
+        '-t',
+        '--timeout',
+        action='store',
+        required=False,
+        default=15,
+        type=int,
+        help='Timeout in Seconds to wait for an SSH connection (default 15)'
+    )
+    optional.add_argument(
+        '--logLevel',
+        action='store',
+        choices=[
+            'CRITICAL',
+            'ERROR',
+            'WARNING',
+            'INFO',
+            'DEBUG',
+            'NOTSET',
+        ],
+        required=False,
+        default='WARNING',
+        help="Desired log level"
+    )
+    optional.add_argument(
+        '-v',
+        '--verbose',
+        action='count',
+        default=0,
+        help='Verbosity level, use up to three times. Example: -vvv'
+    )
+    args = parser.parse_args()
+    return(args)
+
+# Main
+###############################################################################
+
+
+@nagiosplugin.guarded
+def main():
+    args = get_args()
+    options = {**vars(args)}
+    # Setup logging console handler and log format
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter(
+        fmt='%(asctime)s [%(levelname)8s] --- %(message)s', datefmt='%d-%m-%yT%H:%M:%S(%Z)'))
+    logger.addHandler(ch)
+    logger.setLevel(args.logLevel.upper())
+    logger.info("Logging initialized and level set to {}".format(
+        args.logLevel.upper()))
+    if args.file:
+        check = nagiosplugin.Check(CheckSFTP(options), CheckSFTPFileContext(name="exists", warning_flag=args.warning_flag, critical_flag=args.critical_flag))
+    elif args.dir:
+        check = nagiosplugin.Check(CheckSFTP(options), CheckSFTPDirFileContext(name="directory_files", warning_flag=args.warning_flag, critical_flag=args.critical_flag))
+    elif args.login_only:
+        check = nagiosplugin.Check(CheckSFTPLogin(options), CheckSFTPLoginContext(name="login", warning_flag=args.warning_flag, critical_flag=args.critical_flag))
+    else:
+        check = nagiosplugin.Check(CheckSFTP(options), CheckSFTPPermissionsContext(name="permissions", warning_flag=args.warning_flag, critical_flag=args.critical_flag, owner_flag=args.owner_flag, group_flag=args.group_flag, other_flag=args.other_flag))
+    check.main(verbose=args.verbose)
+
+
+if __name__ == '__main__':
+    main()

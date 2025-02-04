@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+#####################################################################
+# Description:
+# 		Opsview/Nagios plugin designed to check the table
+#		space usage of all Oracle table spaces and alert
+#		if the usage is over the given thresholds.
+# Author:
+#		Bo Smith (bo@bosmith.tech)
+# Date:
+#		2017-07-14
+#####################################################################
+import cx_Oracle
+import sys
+import signal
+import argparse
+
+# Parse Arguments
+#####################################################################
+parser = argparse.ArgumentParser(
+    prog='check_oracle_tablespace_growth',
+    usage='%(prog)s [-H] [-u user] [-p password] [-d database]',
+    description='Checks Oracle table space growth metrics')
+parser.add_argument('-H', '--host', action='store', required=True,
+                    help='Host to run query on', metavar='')
+parser.add_argument('-u', '--user', action='store', required=True,
+                    help='Oracle DB User used to run the query', metavar='')
+parser.add_argument('-p', '--password', action='store', required=True,
+                    help='Oracle DB User password', metavar='')
+parser.add_argument('-d', '--database', action='store', required=True,
+                    help='Oracle Database name', metavar='')
+parser.add_argument('-P', '--port', action='store', default='1521',
+                    help='Oracle Database Port (Default is 1521 if not specified)', metavar='')
+parser.add_argument('-t', '--timeout', action='store', type=int, default=10,
+                    help='Timeout in seconds (Default 10 if not specified)', metavar='')
+parser.add_argument('-w', '--warning', action='store', type=int, default=85,
+                    help='Warning Percent Value (Default 85 if not specified)', metavar='')
+parser.add_argument('-c', '--critical', action='store', type=int, default=90,
+                    help='Critical Percent Value (Default 90 if not specified)', metavar='')
+parser.add_argument('-i', '--ignore', action='append', default=[],
+                    help='List of table spaces to ignore (Repeat -i for each table space)', metavar='')
+args = parser.parse_args()
+ora_host = args.host
+ora_user = args.user
+ora_pass = args.password
+ora_db = args.database
+ora_port = args.port
+ora_warn = args.warning
+ora_crit = args.critical
+ops_ok = 0
+ops_warning = 1
+ops_critical = 2
+ops_unknown = 3
+ntimeout = args.timeout
+ts_status = {}
+ts_crit_str = ''
+ts_crit_count = 0
+ts_warn_str = ''
+ts_warn_count = 0
+ts_perf_data = ' | '
+ts_perf_count = 0
+ts_ignore = args.ignore
+
+# Setup Timeout
+#####################################################################
+
+
+def timeout_handler(signum, frame):
+    print('WARNING - Service Check Timed Out')
+    sys.exit(ops_warning)
+
+
+# Timeout will be applied from here on out
+signal.signal(signal.SIGALRM, timeout_handler)
+signal.alarm(ntimeout)
+
+# Setup DB Connection
+#####################################################################
+#ora_query = '''select ddf.TABLESPACE_NAME, ddf.tot_BYTES "Size(MB)", (ddf.tot_BYTES-DFS.BYTES-ddf.diff) "Used(MB)", round(((ddf.tot_BYTES-dfs.BYTES-ddf.diff)/ddf.Tot_BYTES)*100,2) "Used %" from (select TABLESPACE_NAME, sum(greatest(maxbytes,bytes))/1048576 tot_bytes, sum(greatest(maxbytes,bytes)-bytes)/1048576 diff from dba_data_files group by TABLESPACE_NAME) ddf, (select TABLESPACE_NAME, sum(BYTES)/1048576 bytes from dba_free_space group  by TABLESPACE_NAME) dfs where ddf.TABLESPACE_NAME=dfs.TABLESPACE_NAME and round(((ddf.tot_BYTES-dfs.BYTES-ddf.diff)/ddf.Tot_BYTES)*100,2) > 0'''
+ora_query = '''select TABLESPACE_NAME,SIZEMB,USEDMB,USEDPERCENTAGE from SYS.TABLESPACEINFO where USEDPERCENTAGE>92'''
+try:
+    dsn = '(DESCRIPTION =(ENABLE=BROKEN)(CONNECT_TIMEOUT=2)(RETRY_COUNT=3)(TRANSPORT_CONNECT_TIMEOUT=1)(ADDRESS_LIST =(ADDRESS = (PROTOCOL = TCP)(HOST = ' + \
+        ora_host+')(PORT = '+ora_port + \
+        ')))(CONNECT_DATA =(SERVICE_NAME = '+ora_db+')))'
+    con = cx_Oracle.connect(ora_user+'/'+ora_pass+'@'+dsn)
+except cx_Oracle.DatabaseError as err:
+    error, = err.args
+    print('UNKNOWN - Unable to connect to database ' + str(error))
+    sys.exit(ops_unknown)
+
+cur = con.cursor()
+try:
+    cur.execute(ora_query)
+except cx_Oracle.DatabaseError as err:
+    error, = err.args
+    print('UNKNOWN - Error executing query ' + str(error))
+    sys.exit(ops_unknown)
+
+for i in cur:
+    if i[0] not in ts_ignore:
+        ts_status[i[0]] = {'size': i[2], 'used': i[3]}
+cur.close()
+con.close()
+
+# Parse results
+#####################################################################
+for key, value in ts_status.items():
+    host = key
+    used = value['used']
+    size = value['size']
+    # Build the status strings
+    if int(used) >= ora_crit:
+        if ts_crit_count >= 1:
+            ts_crit_str = ts_crit_str + ' :: ' + host + ' ' + str(used) + '%'
+            ts_crit_count = ts_crit_count + 1
+        else:
+            ts_crit_str = ts_crit_str + ' ' + host + ' ' + str(used) + '%'
+            ts_crit_count = ts_crit_count + 1
+    elif int(used) >= ora_warn:
+        if ts_warn_count >= 1:
+            ts_warn_str = ts_warn_str + ' :: ' + host + ' ' + str(used) + '%'
+            ts_warn_count = ts_warn_count + 1
+        else:
+            ts_warn_str = ts_warn_str + ' ' + host + ' ' + str(used) + '%'
+            ts_warn_count = ts_warn_count + 1
+    # Build Performance Data String
+    if ts_perf_count > 0:
+        #ts_perf_data = ts_perf_data + ' ' + host.lower() + '_pct_used=' + str(used) + ' ' + host.lower() + '_size=' + str(size)
+        ts_perf_data = ts_perf_data + ' ' + host.lower() + '_pct_used=' + str(used)
+        ts_perf_count = ts_perf_count + 1
+    else:
+        #ts_perf_data = ts_perf_data + host.lower() + '_pct_used=' + str(used) + ' ' + host.lower() + '_size=' + str(size)
+        ts_perf_data = ts_perf_data + host.lower() + '_pct_used=' + str(used)
+        ts_perf_count = ts_perf_count + 1
+
+# Determine status level and send to Opsview/Nagios
+if ts_crit_count > 0:
+    if ts_warn_count > 0:
+        print('CRITICAL - ' + str(ts_crit_count) + ' CRITICAL table spaces' + ts_crit_str +
+              '\n' + str(ts_warn_count) + ' WARNING table spaces' + ts_warn_str + ts_perf_data)
+        sys.exit(ops_critical)
+    else:
+        print('CRITICAL - ' + str(ts_crit_count) +
+              ' CRITICAL table spaces' + ts_crit_str + ts_perf_data)
+        sys.exit(ops_critical)
+elif ts_warn_count > 0:
+    print('WARNING - ' + str(ts_warn_count) +
+          ' WARNING table spaces' + ts_warn_str + ts_perf_data)
+    sys.exit(ops_warning)
+else:
+    print('OK - All table spaces are within limits' + ts_perf_data)
+    sys.exit(ops_ok)

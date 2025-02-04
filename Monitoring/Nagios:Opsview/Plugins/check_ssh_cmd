@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+###############################################################################
+'''
+Description:    Opsview monitoring plugin that enables a specified command to 
+                be remotely executed over SSH and then compared against a 
+                specific, defined output.
+Date:           2019-10-16
+Author:         Bo Smith (bo@bosmith.tech)
+'''
+###############################################################################
+
+import argparse
+import io
+import operator
+import paramiko
+import sys
+
+ok = 0
+warn = 1
+crit = 2
+unknown = 3
+
+
+# Get Arguments
+###############################################################################
+def get_args():
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="Monitoring plugin that executes defined commands over ssh \n"
+                    "and evaluates the result.\n\n"
+                    "If no warning or critical thresholds are defined, the check\n"
+                    "will only run the comand and return the results without \n"
+                    "alerting",
+    )
+    required = parser.add_argument_group('required options')
+    threshold = parser.add_argument_group('threshold options')
+    optional = parser.add_argument_group('optional options')
+    # Required options
+    required.add_argument(
+        '-H',
+        '--host',
+        action='store',
+        required=True,
+        help='Hostname or IP address'
+    )
+    required.add_argument(
+        '-u',
+        '--username',
+        action='store',
+        required=True,
+        help='Username to SSH to the appliance (Assumed \'opsview\' if blank'
+    )
+    required.add_argument(
+        '-s',
+        '--sshkey',
+        action='store',
+        default='',
+        required=False,
+        help='Path to SSH Key file'
+    )
+    parser.add_argument(
+        '-ss',
+        '--sshkeystring',
+        action='store',
+        default='',
+        required=False,
+        help='SSH Key as String'
+    )
+    required.add_argument(
+        '-p',
+        '--password',
+        action='store',
+        default='',
+        required=False,
+        help='Password for the user (Only used if sshkey is not provided)'
+    )
+    required.add_argument(
+        '--cmd',
+        action='store',
+        required=True,
+        help='Command to execute on the remote host'
+    )
+    optional.add_argument(
+        '-P',
+        '--port',
+        action='store',
+        required=False,
+        default=22,
+        type=int,
+        help='SSH Port to use (Default 22)'
+    )
+    optional.add_argument(
+        '-t',
+        '--timeout',
+        action='store',
+        required=False,
+        default=15,
+        type=int,
+        help='Timeout in Seconds to wait for an SSH connection (default 15)'
+    )
+    # Threshold options
+    threshold.add_argument(
+        '-C',
+        '--comparison',
+        action='store',
+        required=False,
+        choices=['gt', 'ge', 'lt', 'le', 'eq', 'ne'],
+        default='gt',
+        help='Comparison operator to use. \n'
+             'Numeric Comparisons \n'
+             '\tgt: greater than\n'
+             '\tge: greater than or equal to\n'
+             '\tlt: less than\n'
+             '\tle: less than or equal to\n'
+             'String Comparisons \n'
+             '\tne: not equal \n'
+             '\teq: equal to\n'
+             'Default is gt.',
+    )
+    threshold.add_argument(
+        '--exitstatus',
+        action='store_true',
+        required=False,
+        default=False,
+        help='Evaluate exit status instead of stdout (Default is stdout)'
+    )
+    threshold.add_argument(
+        '-w',
+        '--warning',
+        action='store',
+        type=float,
+        required=False,
+        help='Warning threshold for numeric values'
+    )
+    threshold.add_argument(
+        '-c',
+        '--critical',
+        action='store',
+        type=float,
+        required=False,
+        help='Critical threshold for numeric values'
+    )
+    threshold.add_argument(
+        '-ws',
+        '--warnstr',
+        action='store',
+        required=False,
+        help='Warning threshold for string values.  If watching for an empty\n'
+             'data set from the command set this value to "no data"'
+    )
+    threshold.add_argument(
+        '-cs',
+        '--critstr',
+        action='store',
+        required=False,
+        help='Critical threshold for string values.  If watching for an empty\n'
+             'data set from the command set this value to "no data"'
+    )
+    args = parser.parse_args()
+    return(args)
+
+
+# Setup and create Paramiko connection object
+##############################################################################
+def setup_ssh(args):
+    try:
+        # Prep client
+        client = paramiko.SSHClient()
+        client.load_system_host_keys()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        # Build kwargs used to setup ssh connection
+        clientargs = {
+            'banner_timeout': args.timeout,
+            'timeout': args.timeout,
+            'password': args.password,
+            'port': args.port,
+            'username': args.username
+        }
+        # Add ssh key from file if provided as file path
+        if args.sshkey:
+            clientargs['key_filename'] = args.sshkey
+        # Add ssh key from string if provided as string
+        elif args.sshkeystring:
+            s = io.StringIO(args.sshkeystring.replace('\\n', '\n'))
+            opsvkey = paramiko.RSAKey.from_private_key(
+                s,
+                password=args.password
+            )
+            clientargs['pkey'] = opsvkey
+        # Setup Connection
+        client.connect(args.host, **clientargs)
+    except paramiko.AuthenticationException as err:
+        message = 'Authentication failed '+str(err)
+        send_unknown(message)
+    except paramiko.SSHException as err:
+        message = 'Unable to establish SSH connection '+str(err)
+        send_unknown(message)
+    except IOError as err:
+        message = 'Timed Out attempting SSH connection'
+        send_unknown(message)
+    except Exception as err:
+        message = 'Unable to establish SSH connection '+str(err)
+        send_unknown(message)
+    return(client)
+
+
+# Run the Command
+##############################################################################
+def execute_cmd(client, args):
+    data = ''
+    cmd = args.cmd
+    try:
+        stdin, stdout, stderr = client.exec_command(cmd, get_pty=True)
+    except Exception as err:
+        send_unknown(str(err))
+    if args.exitstatus:
+        data = stdout.channel.recv_exit_status()
+    else:
+        try:
+            data = stdout.readline().strip()
+            if data == '':
+                data = 'no data returned'
+        except Exception as err:
+            send_unknown("problem reading data from server "+str(err))
+    return(data)
+
+
+# Avaluate Data
+##############################################################################
+def evaluate_data(args, data):
+    # Functions for parsing string vs parsing numeric values
+    def parse_string(data):
+        # Hold on this is going to get ugly
+        # Start by deciding if we should be worried about what is returned
+        # or what isn't returned (eq, vs ne)
+        if args.comparison == 'eq':
+            if (args.warnstr and args.critstr):
+                if args.critstr in data:
+                    send_critical(args, data)
+                elif args.warnstr in data:
+                    send_warning(args, data)
+                else:
+                    send_ok(args, data)
+            elif args.critstr:
+                if args.critstr in data:
+                    send_critical(args, data)
+                else:
+                    send_ok(args, data)
+            elif args.warnstr:
+                if args.warnstr in data:
+                    send_warning(args, data)
+                else:
+                    send_ok(args, data)
+            else:
+                send_ok(args, data)
+        # If we are worried about what isn't returned
+        elif args.comparison == 'ne':
+            if (args.warnstr and args.critstr):
+                if args.critstr not in data:
+                    send_critical(args, data)
+                elif args.warnstr not in data:
+                    send_warning(args, data)
+                else:
+                    send_ok(args, data)
+            elif args.critstr:
+                if args.critstr not in data:
+                    send_critical(args, data)
+                else:
+                    send_ok(args, data)
+            elif args.warnstr:
+                if args.warnstr not in data:
+                    send_warning(args, data)
+                else:
+                    send_ok(args, data)
+            else:
+                send_ok(args, data)
+
+    def parse_numeric(data):
+        # Start by deciding if we should be worried about what is returned
+        # or what isn't returned (eq, vs ne) and define the operator
+        if args.comparison == 'gt':
+            comp = operator.gt
+        if args.comparison == 'ge':
+            comp = operator.ge
+        if args.comparison == 'lt':
+            comp = operator.lt
+        if args.comparison == 'le':
+            comp = operator.le
+        if args.comparison == 'eq':
+            comp = operator.eq
+        if args.comparison == 'ne':
+            comp = operator.ne
+
+        # If both warn and crit thresholds provided start with crit
+        if (args.warning and args.critical):
+            if comp(data, args.critical):
+                send_critical(args, data)
+            elif comp(data, args.warning):
+                send_warning(args, data)
+            else:
+                send_ok(args, data)
+        # If only the critical threshold is defined, evaluate just critical
+        elif args.critical:
+            if comp(data, args.critical):
+                send_critical(args, data)
+            else:
+                send_ok(args, data)
+        # If only the warning threshold is defined, evaluate just warning
+        elif args.warning:
+            if comp(data, args.warning):
+                send_warning(args, data)
+            else:
+                send_ok(args, data)
+        else:
+            send_ok(args, data)
+
+    # First decide if we are expecting string or numeric data
+    if (args.warnstr or args.critstr):
+        # Ensure the data being passed is a string
+        data = str(data)
+        parse_string(data)
+    elif (args.warning or args.critical):
+        # Ensure the data being passed is numeric
+        try:
+            data = float(data)
+        except:
+            send_unknown('Unable to evaluate received data "{}"'.format(data))
+        parse_numeric(data)
+    else:
+        send_ok(args, data)
+
+
+# Alert Functions
+##############################################################################
+def send_warning(args, message):
+    if args.exitstatus:
+        print('WARNING - Exit status is {} | exit_status={}'.format(
+            str(int(message)),
+            str(int(message))
+        )
+        )
+    else:
+        print('WARNING - Result is '+str(message))
+    sys.exit(warn)
+
+
+def send_critical(args, message):
+    if args.exitstatus:
+        print('CRITICAL - Exit status is {} | exit_status={}'.format(
+            str(int(message)),
+            str(int(message))
+        )
+        )
+    else:
+        print('CRITICAL - Result is '+str(message))
+    sys.exit(crit)
+
+
+def send_ok(args, message):
+    if args.exitstatus:
+        print('OK - Exit status is {} | exit_status={}'.format(
+            str(int(message)),
+            str(int(message))
+        )
+        )
+    else:
+        print('OK - Result is '+str(message))
+    sys.exit(ok)
+
+
+def send_unknown(message):
+    print('UNKNOWN - '+str(message))
+    sys.exit(unknown)
+
+
+# Main
+###############################################################################
+def main():
+    args = get_args()
+    client = setup_ssh(args)
+    data = execute_cmd(client, args)
+    evaluate_data(args, data)
+
+
+if __name__ == '__main__':
+    main()

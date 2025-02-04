@@ -1,0 +1,841 @@
+#!/usr/bin/env python3
+##############################################################################
+'''
+Description:    Opsview plugin to monitor Kubernetes clusters
+Date:           2019-10-28
+Author:         Bo Smith (bo@bosmith.tech)
+Notes:          Plugin authentication is based on service account tokens
+                and cluster certificate.
+'''
+##############################################################################
+
+import argparse
+import base64
+import io
+import json
+import re
+import requests
+import os
+import pprint
+import sys
+import tempfile
+from datetime import datetime, timedelta
+
+# Alert vars
+ok = 0
+warn = 1
+crit = 2
+unknown = 3
+
+
+# Get arguments
+##############################################################################
+def get_args():
+    metric_choices = [
+        'api_status',
+        'cluster_health',
+        'component_status',
+        'deployment_status',
+        'events',
+        'node_cpu_allocated',
+        'node_memory_allocated',
+        'node_status',
+        'namespace_status',
+        'persistentvolume_status',
+        'pod_status',
+        'replicaset_status'
+    ]
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description='Opsview plugin to monitor kubernetes clusters'
+    )
+    cluster = parser.add_argument_group('cluster options (required)')
+    metric = parser.add_argument_group('metric options')
+    threshold = parser.add_argument_group('threshold options')
+    cluster.add_argument(
+        '-i',
+        '--ip',
+        action='store',
+        required=True,
+        help='IP Address of the cluster'
+    )
+    cluster.add_argument(
+        '-t',
+        '--token',
+        action='store',
+        help='Auth token'
+    )
+    cluster.add_argument(
+        '--cert',
+        action='store',
+        help='Certificate for the cluster'
+    )
+    metric.add_argument(
+        '--metric',
+        choices=metric_choices,
+        action='store',
+        required=True,
+        help='Metric to collect\n'
+        ' - api_status: Queries the k8s api for status of all APIs\n'
+        '           Use -w or -c to define alert level (Default -c)\n'
+        ' - cluster_health: Checks the global health of the cluster\n'
+        '           Use -w or -c to define alert level (Default -c)\n'
+        ' - component_status: Checks the status of all components\n'
+        '           Use -w or -c to define alert level (Default -c)\n'
+        ' - deployment_status: Checks the status of all deployments\n'
+        '           Use -w or -c to define alert level (Default -c)\n'
+        ' - events: Checks for any event that is not \'Normal\'\n'
+        '           can be used with --lookback to look back x minutes\n'
+        '           otherwise uses k8s default\n'
+        ' - node_cpu_allocated: Checks for allocated usage of cpu\n'
+        '           Use --warning/--critical for thresholds\n'
+        ' - node_memory_allocated: Checks for allocated usage of memory\n'
+        '           Use --warning/--critical for thresholds\n'
+        ' - node_status: Global status of all nodes\n'
+        '           Use -w or -c to define alert level (Default -c)\n'
+        ' - namespace_status: Global status of all namespaces\n'
+        '           Use -w or -c to define alert level (Default -c)\n'
+        ' - persistentvolume_status: Global status of all persistent volumes\n'
+        '           Use -w or -c to define alert level (Default -c)\n'
+        ' - pod_status: Global status of all pods\n'
+        '           Use -w or -c to define alert level (Default -c)\n'
+        ' - replicaset_status: Global status of all replicasets\n'
+        '           Use -w or -c to define alert level (Default -c)\n'
+    )
+    threshold.add_argument(
+        '-w',
+        '--warn',
+        action='store_true',
+        default=False,
+        help='Set this option to issue a warning alert for status checks'
+    )
+    threshold.add_argument(
+        '-c',
+        '--crit',
+        action='store_true',
+        default=False,
+        help='Set this option to issue a critical alert for status checks'
+    )
+    threshold.add_argument(
+        '--lookback',
+        action='store',
+        type=int,
+        help='Time in minutes to lookback, used with --metric events'
+    )
+    threshold.add_argument(
+        '--warning',
+        action='store',
+        type=int,
+        help='Set this option to issue a warning alert for metric checks'
+    )
+    threshold.add_argument(
+        '--critical',
+        action='store',
+        type=int,
+        help='Set this option to issue a critical alert for metric checks'
+    )
+    args = parser.parse_args()
+    return(args)
+
+
+# Decode Cert
+##############################################################################
+def decode_cert(args):
+    cacert = tempfile.NamedTemporaryFile(delete=False)
+    cacert.write(base64.b64decode(args.cert))
+    cacert.close()
+    return(cacert)
+
+
+# Setup Session
+##############################################################################
+def setup_session(args, cacert):
+    # Here we authenticate and setup our requests session object
+    # First base64 decode the token
+    token = base64.b64decode(args.token).decode("utf-8")
+
+    # Create our Session object and add the token and headers
+    s = requests.Session()
+    s.headers.update({'content-type': 'application/json'})
+    s.headers.update({'Authorization': 'Bearer '+token})
+    s.verify = cacert.name
+
+    # Test the connection and bail out of it doesn't go well
+    try:
+        t = s.get('https://'+args.ip+'/api')
+        t.raise_for_status()
+    except requests.exceptions.ConnectionError as err:
+        send_unknown(str(err))
+    except requests.exceptions.HTTPError as err:
+        send_unknown(str(err))
+    return(s)
+
+
+# Get API Status
+##############################################################################
+def get_api_status(args, sess):
+    url = 'https://'+args.ip+'/apis/apiregistration.k8s.io/v1/apiservices'
+    a = sess.get(url)
+    error = {}
+
+    # Get list of apis and their status
+    try:
+        a.raise_for_status()
+        apis = a.json()
+    except:
+        message = json.loads(a.content)['message']
+        send_unknown(message)
+
+    # Not sure this is necessary, would an api service ever go down?
+    # I guess if it does we'll now know.
+    for api in apis['items']:
+        name = api['metadata']['name']
+        for a in api['status']['conditions']:
+            if a['status'] != 'True':
+                error[name] = a['status']
+
+    if len(error) == 0:
+        message = 'All APIs are available'
+        send_ok(message)
+    elif len(error) > 0:
+        message = ''
+        for e in error:
+            message += e+' is unavailable '
+        process_message(args, message)
+
+
+# Get Overall Health
+##############################################################################
+def get_cluster_health(args, sess):
+    url = 'https://'+args.ip+'/healthz'
+    # Get overall cluster health
+    h = sess.get(url)
+
+    # Sanity Check
+    try:
+        h.raise_for_status()
+        health = str(h.text)
+    except Exception as err:
+        send_unknown(str(err))
+
+    # If not OK, freak out
+    if health != 'ok':
+        send_critical('Cluster status is '+health)
+    else:
+        send_ok('Cluster status is '+health)
+
+
+# Get Component Status
+##############################################################################
+def get_component_status(args, sess):
+    url = 'https://'+args.ip+'/api/v1/componentstatuses'
+    c = sess.get(url)
+    error = {}
+
+    # Get the componentstatuses
+    try:
+        c.raise_for_status()
+        comp = c.json()
+    except:
+        message = json.loads(c.content)['message']
+        send_unknown(message)
+
+    # Parse the results and look for status info
+    # Put any unhealthy status in the error dict
+    for c in comp['items']:
+        component = c['metadata']['name']
+        for h in c['conditions']:
+            # conditions are in a list meaning there can be more than 1
+            # condition so we will look specifically for the Healthy
+            # condition.
+            if h['type'] == 'Healthy':
+                healthy = h['status']
+        # print(component+' status is '+healthy)
+        if healthy != 'True':
+            error[component] = healthy
+
+    if len(error) == 0:
+        message = 'All components are reporting healthy'
+        send_ok(message)
+    elif len(error) > 0:
+        message = ''
+        for c in error:
+            message += c+' is unhealthy '
+        process_message(args, message)
+
+
+# Get Deployment Status
+##############################################################################
+def get_deployment_status(args, sess):
+    url = 'https://'+args.ip+'/apis/apps/v1/deployments'
+    available = []
+    errors = {}
+
+    # Get the deployment status
+    try:
+        d = sess.get(url)
+        deployments = d.json()
+        d.raise_for_status()
+    except:
+        message = json.loads(d.content)['message']
+        send_unkown(message)
+
+    # Parse status
+    for deployment in deployments['items']:
+        name = deployment['metadata']['name']
+        for c in deployment['status']['conditions']:
+            if (c['type'] == 'Progressing' and c['status'] != 'True'):
+                errors[name] = {c['type']: c['reason']}
+            elif (c['type'] == 'Available' and c['status'] != 'True'):
+                errors[name] = {c['type']: c['reason']}
+            else:
+                available.append(name)
+
+    perfdata = ' | deployments_available='+str(len(available))
+    perfdata += ' deployment_errors='+str(len(errors))
+    if len(errors) == 0:
+        message = 'All '+str(len(available))+' deployments are available'
+        message += perfdata
+        send_ok(message)
+    elif len(errors) > 0:
+        message = ''
+        for err, detail in errors.items():
+            for key, value in detail.items():
+                if key == 'Available':
+                    message += ' '+err+' is not available'
+                if key == 'Progressing':
+                    message += ' '+err+' is not progressing'
+        message += perfdata
+        process_message(args, message)
+
+
+# Get Events
+##############################################################################
+def get_events(args, sess):
+    url = 'https://'+args.ip+'/api/v1/events'
+    eventlist = []
+    if args.lookback:
+        lookback = datetime.utcnow() - timedelta(minutes=args.lookback)
+
+    try:
+        e = sess.get(url)
+        e.raise_for_status()
+        events = e.json()
+    except:
+        message = json.loads(e.content)['message']
+        send_unknown(message)
+
+    if len(events['items']) > 0:
+        for event in events['items']:
+            tmp = {}
+            if event['type'] != 'Normal':
+                dt = datetime.strptime(
+                    event['lastTimestamp'], '%Y-%m-%dT%H:%M:%SZ')
+                # If lookback is defined, only include results within the
+                # the time frame supplied
+                if args.lookback:
+                    if dt > lookback:
+                        tmp[event['type']] = event['message']
+                        tmp[event['type']] += ' ' + \
+                            event['involvedObject']['name']
+                        eventlist.append(tmp)
+                else:
+                    tmp[event['type']] = event['message']
+                    tmp[event['type']] += ' '+event['involvedObject']['name']
+                    eventlist.append(tmp)
+
+    if len(eventlist) > 0:
+        message = str(len(eventlist))+' Events, '
+        count = 0
+        for e in eventlist:
+            for key, value in e.items():
+                if count > 0:
+                    message += ', '+key+' '+value
+                else:
+                    message += key+' '+value
+                count += 1
+        process_message(args, message)
+    else:
+        message = str(len(eventlist))+' Events'
+        send_ok(message)
+
+
+# Get Nodes CPU
+##############################################################################
+def get_node_cpu_allocated(args, sess):
+    # Get nodes
+    # For each node, get pods
+    # For each pod get cpu
+    # url = 'https://'+args.ip+'/apis/metrics.k8s.io/v1beta1/nodes'
+    url = 'https://'+args.ip+'/api/v1/nodes'
+    perfdata = ' | '
+    message = ''
+    nodecpu = {}
+
+    try:
+        n = sess.get(url)
+        n.raise_for_status()
+        nodes = n.json()
+    except:
+        message = json.loads(n.content)['message']
+        send_unknown(message)
+
+    # Go through all the nodes and get the 'allocateable metric'
+    for node in nodes['items']:
+        allocatable = node['status']['allocatable']['cpu']
+        # Check if value is in millicores
+        if re.search(r'm$', allocatable):
+            allocatable = int(allocatable[:-1])
+        # If not, convert to millicore
+        else:
+            allocatable = int(allocatable) * 1000
+        # Add data to the nodecpu dict
+        nodecpu[node['metadata']['name']] = {'allocated': 0}
+        nodecpu[node['metadata']['name']]['allocatable'] = allocatable
+
+    # Now get the allocated metric for each container
+    purl = 'https://'+args.ip+'/api/v1/pods'
+    p = sess.get(purl)
+    pods = p.json()['items']
+    for pod in pods:
+        nodename = pod['spec']['nodeName']
+        for c in pod['spec']['containers']:
+            if c['resources'] != {}:
+                # Check if value is in millicores
+                req = c['resources']['requests']['cpu']
+                if re.search(r'm$', req):
+                    req = int(req[:-1])
+                # If not, convert to millicores
+                else:
+                    req = int(req) * 1000
+                nodecpu[nodename]['allocated'] += int(req)
+
+    for node, values in nodecpu.items():
+        pct = values['allocated'] / values['allocatable'] * 100
+        pct = round(pct, 2)
+        nodecpu[node]['percent'] = pct
+
+    # Build the message
+    message = ''
+    perfdata = ' | '
+    for node, metric in nodecpu.items():
+        message += node+' cpu millicores: '+str(metric['allocated'])
+        message += ', pct: '+str(metric['percent'])+' '
+        perfdata += node+"_allocated="+str(metric['allocated'])+' '
+        perfdata += node+"_pct="+str(metric['percent'])+' '
+    message += perfdata
+
+    # Determine alert level
+    # Structred so we can support only warning, only critical or a combination
+    if (args.critical and args.warning):
+        if any(i['percent'] > args.critical for n, i in nodecpu.items()):
+            send_critical(message)
+        elif any(i['percent'] > args.warning for n, i in nodecpu.items()):
+            send_warning(message)
+        else:
+            send_ok(message)
+    elif args.critical:
+        if any(i['percent'] > args.critical for n, i in nodecpu.items()):
+            send_critical(message)
+        else:
+            send_ok(message)
+    elif args.warning:
+        if any(i['percent'] > args.warning for n, i in nodecpu.items()):
+            send_warning(message)
+        else:
+            send_ok(message)
+    else:
+        send_ok(message)
+
+
+# Get Nodes Memory Allocated
+##############################################################################
+def get_node_memory_allocated(args, sess):
+    url = 'https://'+args.ip+'/api/v1/nodes'
+    nodemem = {}
+
+    try:
+        n = sess.get(url)
+        n.raise_for_status()
+        nodes = n.json()
+    except:
+        message = json.loads(n.content)['message']
+        send_unknown(message)
+
+        # Go through all the nodes and get the 'allocateable metric'
+    for node in nodes['items']:
+        allocatable = node['status']['allocatable']['memory']
+        # Check if value is in millicores
+        m = re.search(r'(^.+)(Ei$|Pi$|Ti$|Mi$|Ki$)', allocatable)
+        mem = convert_to_bytes(int(m.group(1)), m.group(2))
+        nodemem[node['metadata']['name']] = {'allocated': 0}
+        nodemem[node['metadata']['name']]['allocatable'] = mem
+
+    # Now get the allocated metric for each container
+    purl = 'https://'+args.ip+'/api/v1/pods'
+    p = sess.get(purl)
+    pods = p.json()['items']
+    for pod in pods:
+        nodename = pod['spec']['nodeName']
+        for c in pod['spec']['containers']:
+            try:
+                req = c['resources']['requests']['memory']
+                m = re.search(r'(^.+)(Ei$|Pi$|Ti$|Mi$|Ki$)', req)
+                req = convert_to_bytes(int(m.group(1)), m.group(2))
+                nodemem[nodename]['allocated'] += int(req)
+            except KeyError:
+                pass
+
+    # Calculate pct allocated
+    for node, values in nodemem.items():
+        pct = values['allocated'] / values['allocatable'] * 100
+        pct = round(pct, 2)
+        nodemem[node]['percent'] = pct
+
+    # Build the message
+    message = ''
+    perfdata = ' | '
+    for node, metric in nodemem.items():
+        message += node+' bytes: '+str(metric['allocated'])
+        message += ', pct: '+str(metric['percent'])+'% '
+        perfdata += node+"_allocated="+str(metric['allocated'])+' '
+        perfdata += node+"_pct="+str(metric['percent'])+' '
+    message += perfdata
+
+    # Determine alert level
+    # Structred so we can support only warning, only critical or a combination
+    if (args.critical and args.warning):
+        if any(i['percent'] > args.critical for n, i in nodemem.items()):
+            send_critical(message)
+        elif any(i['percent'] > args.warning for n, i in nodemem.items()):
+            send_warning(message)
+        else:
+            send_ok(message)
+    elif args.critical:
+        if any(i['percent'] > args.critical for n, i in nodemem.items()):
+            send_critical(message)
+        else:
+            send_ok(message)
+    elif args.warning:
+        if any(i['percent'] > args.warning for n, i in nodemem.items()):
+            send_warning(message)
+        else:
+            send_ok(message)
+    else:
+        send_ok(message)
+
+
+# Get Nodes Status
+##############################################################################
+def get_node_status(args, sess):
+    url = 'https://'+args.ip+'/api/v1/nodes'
+    ready = []
+    other = {}
+
+    # Get the nodes ...
+    n = sess.get(url)
+
+    # Sanity check
+    try:
+        n.raise_for_status()
+        nodes = n.json()['items']
+    except:
+        message = json.loads(n.content)['message']
+        send_unknown(message)
+
+    # Hold on to your butts
+    # <Sam Jackson GIF Here>
+    for node in nodes:
+        errcount = 0
+        # Check all the conditions
+        for cond in node['status']['conditions']:
+            name = node['metadata']['name']
+            if (cond['type'] == 'MemoryPressure' and
+                    cond['status'] != 'False'):
+                other[name] = {
+                    cond['type']: cond['message']
+                }
+                errcount += 1
+            if (cond['type'] == 'DiskPressure' and
+                    cond['status'] != 'False'):
+                other[name] = {
+                    cond['type']: cond['message']
+                }
+                errcount += 1
+            if (cond['type'] == 'PIDPressure' and
+                    cond['status'] != 'False'):
+                other[name] = {
+                    cond['type']: cond['message']
+                }
+                errcount += 1
+            if (cond['type'] == 'Ready' and
+                    cond['status'] != 'True'):
+                other[name] = {
+                    cond['type']: cond['message']
+                }
+                errcount += 1
+        if errcount == 0:
+            ready.append(node['metadata']['name'])
+
+    perfdata = ' | node_ready_count='+str(len(ready))
+    perfdata += ' node_error_count='+str(len(other))
+    if len(other) == 0:
+        message = 'All '+str(len(ready))+' nodes are ready'
+        message += perfdata
+        send_ok(message)
+    else:
+        message = ''
+        for name, cond in other.items():
+            for key, value in cond.items():
+                message += name+' '+key+' '+value + ', '
+        message += str(len(ready))+' nodes are ready'
+        message += perfdata
+        process_message(args, message)
+
+
+# Get Namespace Status
+##############################################################################
+def get_namespace_status(args, sess):
+    url = 'https://'+args.ip+'/api/v1/namespaces'
+    active_count = 0
+    errors = {}
+
+    # Get all namespaces
+    try:
+        n = sess.get(url)
+        n.raise_for_status()
+        ns = n.json()
+    except requests.exceptions.ConnectionError as err:
+        send_unknown(str(err))
+    except:
+        message = json.loads(n.content)['message']
+        send_unknown(message)
+
+    # Check status
+    for n in ns['items']:
+        name = n['metadata']['name']
+        status = n['status']['phase']
+        if status == 'Active':
+            active_count += 1
+        else:
+            error[name] = status
+
+    # Send results
+    perfdata = ' | ns_active_count='+str(active_count)
+    perfdata += ' ns_error_count='+str(len(errors))
+    if len(errors) == 0:
+        message = 'All '+str(active_count)+' namespaces are Active'
+        message += perfdata
+        send_ok(message)
+    else:
+        message = ''
+        for n, stat in errors.items():
+            message += 'Namespace '+n+' is '+stat
+        message += perfdata
+        process_message(args, message)
+
+
+# Get Persistentvolume Status
+##############################################################################
+def get_persistentvolume_status(args, sess):
+    url = 'https://'+args.ip+'/api/v1/persistentvolumes'
+    errors = []
+
+    try:
+        p = sess.get(url)
+        p.raise_for_status()
+        pv = p.json()
+    except:
+        message = json.loads(c.content)['message']
+        send_unknown(message)
+
+    if len(pv['items']) > 0:
+        for v in pv['items']:
+            name = v['metadata']['name']
+            if v['status']['phase'] != 'Bound':
+                errors.append({name: v['status']['phase']})
+    else:
+        send_ok('No persistentvolumes to check')
+
+    if len(errors) > 0:
+        message = ''
+        for error in errors:
+            for key, value in error.items():
+                message += key+' phase is '+value
+                print(message)
+        process_message(args, message)
+    else:
+        message = 'All persistent volumes are bound'
+        send_ok(message)
+
+
+# Get Pod Status
+##############################################################################
+def get_pod_status(args, sess):
+    running = []
+    other = {}
+
+    # Get list of all pods
+    p = sess.get(
+        'https://'+args.ip+'/api/v1/pods'
+    )
+    # Sanity check, send unkown if there was a problem
+    try:
+        p.raise_for_status()
+        pods = p.json()
+    except:
+        message = json.loads(p.content)['message']
+        send_unknown(message)
+
+    # Pull status keys and values from json
+    for pod in pods['items']:
+        if pod['status']['phase'] != 'Running':
+            other[pod['metadata']['name']] = pod['status']['phase']
+        else:
+            running.append(pod['metadata']['name'])
+        for container in pod['status']['containerStatuses']:
+            for cstate in container['state']:
+                if cstate != 'running':
+                    other[container['name']] = cstate
+
+    perfdata = ' | pod_running_count='+str(len(running))
+    perfdata += ' pod_error_count='+str(len(other))
+    # If we have not error states, send_ok and move along
+    if len(other) == 0:
+        message = 'All '+str(len(running))+' pods are running'
+        message += perfdata
+        send_ok(message)
+    # Otherwise, there is a problem, decide what level of alert to send
+    elif len(other) > 0:
+        message = ''
+        for pod, state in other.items():
+            message += pod+' is '+state+', '
+        message += str(len(running))+' pods are running'
+        message += perfdata
+        process_message(args, message)
+
+
+# Get Replicasets Status
+##############################################################################
+def get_replicaset_status(args, sess):
+    url = 'https://'+args.ip+'/apis/apps/v1/replicasets'
+    ready_count = 0
+    errors = {}
+
+    # Get all replica sets
+    try:
+        r = sess.get(url)
+        r.raise_for_status()
+        replicasets = r.json()
+    except:
+        message = json.loads(r.content)['message']
+        send_unknown(message)
+    # Get name an status for each replicaset
+    for r in replicasets['items']:
+        name = r['metadata']['name']
+        desired = int(r['metadata']['annotations']
+                      ['deployment.kubernetes.io/desired-replicas'])
+        # Only included replica sets that are not in kube-system
+        if r['metadata']['namespace'] != 'kube-system':
+            try:
+                ready = r['status']['readyReplicas']
+            except:
+                ready = 0
+            if ready < desired:
+                errors[name] = {'ready': ready, 'desired': desired}
+            else:
+                ready_count += ready
+    perfdata = ' | ready_replicasets='+str(ready_count)+' error_replicasets='
+    perfdata += str(len(errors))
+    if len(errors) == 0:
+        message = 'Ready replicasets '+str(ready_count)+', Error replicasets '
+        message += str(len(errors))
+        message += perfdata
+        send_ok(message)
+    if len(errors) > 0:
+        message = ''
+        for rs, stat in errors.items():
+            message += rs+' has '+str(stat['ready'])+' ready rs'
+            message += ' desired '+str(stat['desired'])
+            if len(errors) > 1:
+                message += ', '
+        message += perfdata
+        process_message(args, message)
+
+
+# Helper function to conver memory values to byes
+##############################################################################
+def convert_to_bytes(value, unit):
+    # Look at the unit provided and determine which calculations to make
+
+    # Kibibytes KiB
+    if unit == 'Ki':
+        converted = value * 1024
+    # Mebibytes MiB
+    if unit == 'Mi':
+        converted = value * (1024**2)
+    # Gibibytes GiB
+    if unit == 'Gi':
+        converted = value * (1024**3)
+    # Tebibytes TiB
+    if unit == 'Ti':
+        converted = value * (1024**4)
+    # Pebibytes PiB
+    if unit == 'Pi':
+        converted = value * (1024**5)
+    # Exbibytes EiB
+    if unit == 'Ei':
+        converted = value * (1024**6)
+
+    # Return the converted value
+    return(converted)
+
+
+# Process Message
+##############################################################################
+def process_message(args, message):
+    # OMFGBBQ!!
+    if ((args.crit == False and args.warn == False) or
+            args.crit == True):
+        send_critical(message)
+    # Meh
+    elif args.warn:
+        send_warning(message)
+
+
+# Alert Functions
+##############################################################################
+def send_warning(message):
+    print('WARNING - '+str(message))
+    sys.exit(warn)
+
+
+def send_critical(message):
+    print('CRITICAL - '+str(message))
+    sys.exit(crit)
+
+
+def send_ok(message):
+    print('OK - '+str(message))
+    sys.exit(ok)
+
+
+def send_unknown(message):
+    print('UNKNOWN - '+str(message))
+    sys.exit(unknown)
+
+
+# Main
+##############################################################################
+def main():
+    args = get_args()
+    cacert = decode_cert(args)
+    sess = setup_session(args, cacert)
+    # This trick calls the appropriate function by the metric that is passed
+    globals()['get_'+args.metric](args, sess)
+    sess.close()
+    os.remove(cacert.name)
+
+
+if __name__ == '__main__':
+    main()

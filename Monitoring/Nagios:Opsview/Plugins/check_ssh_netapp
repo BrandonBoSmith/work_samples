@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+##############################################################################
+'''
+Description:		Nagios/Opsview plugin to gather NetApp Storage 
+			metrics via an SSH account.
+Author:			Bo Smith (bo@bosmith.tech)
+Date: 			208-09-05
+'''
+##############################################################################
+import paramiko
+import pprint
+import argparse
+import sys
+from datetime import datetime
+from datetime import timedelta
+import time
+
+parser = argparse.ArgumentParser(
+    prog='check_ssh_netapp',
+    usage='%(prog)s [-H] [-u] [-p]',
+    description='Uses ssh creds to connect to a NetApp SAN and gather metrics')
+parser.add_argument('-H', '--host', action='store', required=True,
+                    help='Host name or IP address')
+parser.add_argument('-u', '--username', action='store', required=True,
+                    help='Username to SSH to the appliance')
+parser.add_argument('-p', '--password', action='store', required=True,
+                    help='Password for the user')
+parser.add_argument('-w', '--warning', action='store_true', default=True,
+                    help='If set, will issue a WARNING (Default)')
+parser.add_argument('-c', '--critical', action='store_true', default=False,
+                    help='If set, will issue a CRITICAL')
+parser.add_argument('--systemhealth', action='store_true', default=False,
+                    help='System Health Check')
+parser.add_argument('--subsystemhealth', action='store_true', default=False,
+                    help='Subsystem Health Check')
+parser.add_argument('--systemconnectivityshelf', action='store_true', default=False,
+                    help='System level health of the shelf')
+parser.add_argument('--nodeconnectivityshelf', action='store_true', default=False,
+                    help='Node level health of the shelf')
+parser.add_argument('--nodeconnectivitydisk', action='store_true', default=False,
+                    help='Node disk connectivity ')
+parser.add_argument('--nodeconnectivityadapter', action='store_true', default=False,
+                    help='Node adapter connectivity ')
+args = parser.parse_args()
+host = args.host
+username = args.username
+password = args.password
+warning = args.warning
+critical = args.critical
+port = 22
+cmd = ''
+ov_ok = 0
+ov_warn = 1
+ov_crit = 2
+ov_unknown = 3
+
+# Setup and connect
+##############################################################################
+try:
+    client = paramiko.SSHClient()
+    client.load_system_host_keys()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(host, port=port, username=username,
+                   password=password, timeout=10)
+except paramiko.AuthenticationException as err:
+    print('WARNING - Authentication failed '+str(err))
+    sys.exit(ov_warn)
+except paramiko.SSHException as err:
+    print('WARNING - Unable to establish SSH connection '+str(err))
+    sys.exit(ov_warn)
+except IOError as err:
+    print('WARNING - Timed Out attempting SSH connection')
+    sys.exit(ov_warn)
+except Exception as err:
+    print('WARNING - Unable to establish SSH connection '+str(err))
+    sys.exit(ov_warn)
+
+
+# Get local time as seen by NetApp
+##############################################################################
+def get_local_time(client):
+    try:
+        stdin, stdout, stderr = client.exec_command('date +%s', get_pty=True)
+        localtime = stdout.readlines()[0].strip()
+        localtime = int(localtime)
+        error = stderr.read().strip()
+    except Exception as err:
+        print('WARNING - Unable to get local time: '+str(error))
+        client.close()
+        sys.exit(ov_warn)
+    localtime = datetime.fromtimestamp(localtime)
+    timeframe = localtime - timedelta(minutes=mins)
+
+
+# Get system health report
+##############################################################################
+def get_system_health(client):
+    cmd = "system health status show"
+    try:
+        stdin, stdout, stderr = client.exec_command(cmd, get_pty=True)
+        systemhealth = stdout.readlines()[2].strip()
+        error = stderr.read().strip()
+    except Exception:
+        alert_unknown("Unable to get system health status"+str(error))
+        client.close()
+    # Evaluate Results
+    if systemhealth == "ok":
+        alert_ok("System Health is OK")
+    elif systemhealth == "degraded":
+        alert_warning("System Health is Degraded")
+    elif systemhealth == "ok-with-suppressed":
+        alert_ok("System Health is ok-with-suppressed")
+    elif systemhealth == "unreachable":
+        alert_critical("System Health is unreachable")
+    else:
+        alert_unknown("System is reporting an unclear status " +
+                      str(systemhealth))
+
+
+# Get system health subsytem report
+##############################################################################
+def get_system_health_subsystem(client):
+    output = ''
+    okcount = 0
+    cmd = 'set -showallfields true; set -showseparator ","; system health subsystem show'
+    try:
+        stdin, stdout, stderr = client.exec_command(cmd, get_pty=True)
+        systemhealth = stdout.readlines()[2:]
+        systemhealth = systemhealth[2:-2]
+        error = stderr.read().strip()
+        client.close()
+    except Exception as err:
+        alert_unknown("Unable to get system health status"+str(err))
+        client.close()
+
+    total = len(systemhealth)
+    for sys in systemhealth:
+        try:
+            system, status = sys.split(",")[:2]
+        except Exception as err:
+            alert_unknown('Problem extracting subsystem health '+str(err))
+
+        if status == "ok":
+            okcount += 1
+            output += " {} {}".format(system, status)
+        elif status == "degraded":
+            output += " {} {}".format(system, status)
+        elif status == "ok-with-suppressed":
+            okcount += 1
+            output += " {} {}".format(system, status)
+        elif status == "unreachable":
+            output += " {} {}".format(system, status)
+    if okcount == total:
+        #alert_ok(output+" All Subsystems OK")
+        alert_ok(output)
+    elif okcount < total:
+        if args.critical == True:
+            alert_critical(output)
+        else:
+            alert_warning(output)
+    else:
+        alert_unknown("System is reporting an unclear status ")
+
+
+# Get system connectivity to the shelf
+##############################################################################
+def get_system_connectivity_shelf(client):
+    output = ''
+    okcount = 0
+    cmd = 'set -showallfields true; set -showseparator ","; system health system-connectivity shelf show'
+    try:
+        stdin, stdout, stderr = client.exec_command(cmd, get_pty=True)
+        systemhealth = stdout.readlines()[2:]
+        systemhealth = systemhealth[2:-2]
+        error = stderr.read().strip()
+        client.close()
+    except Exception as err:
+        alert_unknown("Unable to get system health status"+str(err))
+        client.close()
+
+    total = len(systemhealth)
+    pprint.pprint
+    for sys in systemhealth:
+        try:
+            tmp = sys.split(",")
+            status = tmp[4]
+            uuid = tmp[1]
+        except Exception as err:
+            alert_unknown(
+                'Problem extracting system connectivity shelf info '+str(err))
+
+        if status == "ok":
+            okcount += 1
+            output += " Shelf UUID {} {}".format(uuid, status)
+        else:
+            output += " Shelf UUID {} {}".format(uuid, status)
+    if okcount == total:
+        alert_ok(output)
+    elif okcount < total:
+        if args.critical == True:
+            alert_critical(output)
+        else:
+            alert_warning(output)
+    else:
+        alert_unknown("System is reporting an unclear status ")
+
+
+# Get system node connectivity to the shelf
+##############################################################################
+def get_node_connectivity_shelf(client):
+    output = ''
+    okcount = 0
+    cmd = 'set -showallfields true; set -showseparator ","; system health node-connectivity shelf show'
+    try:
+        stdin, stdout, stderr = client.exec_command(cmd, get_pty=True)
+        systemhealth = stdout.readlines()[2:]
+        systemhealth = systemhealth[2:-2]
+        error = stderr.read().strip()
+        client.close()
+    except Exception as err:
+        alert_unknown("Unable to get system health status"+str(err))
+        client.close()
+
+    total = len(systemhealth)
+    for sys in systemhealth:
+        try:
+            tmp = sys.split(",")
+            status = tmp[-3]
+            node = tmp[0]
+            shelf = tmp[3]
+        except Exception as err:
+            alert_unknown(
+                'Problem extracting system connectivity shelf info '+str(err))
+
+        if status == "ok":
+            okcount += 1
+        else:
+            output += "Node:{} Shelf:{} Status:{} ".format(node, shelf, status)
+    if okcount == total:
+        alert_ok(
+            "All node shelf connectivity is reporting ok | ok_count="+str(okcount))
+    elif okcount < total:
+        if args.critical == True:
+            alert_critical(output+"| ok_count="+str(okcount))
+        else:
+            alert_warning(output+"| ok_count="+str(okcount))
+    else:
+        alert_unknown("System is reporting an unclear status ")
+
+
+# Get node disk connectivity
+##############################################################################
+def get_node_disk_connectivity(client):
+    output = ''
+    okcount = 0
+    cmd = 'set -showallfields true; set -showseparator ","; system health node-connectivity disk show'
+    try:
+        stdin, stdout, stderr = client.exec_command(cmd, get_pty=True)
+        systemhealth = stdout.readlines()[2:]
+        systemhealth = systemhealth[2:-2]
+        error = stderr.read().strip()
+        client.close()
+    except Exception as err:
+        alert_unknown("Unable to get system health status"+str(err))
+        client.close()
+
+    total = len(systemhealth)
+    for sys in systemhealth:
+        try:
+            tmp = sys.split(",")
+            status = tmp[-2]
+            node = tmp[0]
+            serial = tmp[1].strip('"')
+            serial = serial.strip()
+            shelf = tmp[6]
+            bay = tmp[7]
+        except Exception as err:
+            alert_unknown(
+                'Problem extracting node disk connectivity info '+str(err))
+        if status == "ok":
+            okcount += 1
+        else:
+            output += "Status {} on {} {} {} {} ".format(
+                status, node, serial, shelf, bay)
+    if okcount == total:
+        alert_ok('All Disks reporting OK | ok_count='+str(okcount))
+    elif okcount < total:
+        if args.critical == True:
+            alert_critical(output+' | ok_count='+str(okcount))
+        else:
+            alert_critical(output+' | ok_count='+str(okcount))
+    else:
+        alert_unknown("System is reporting an unclear status ")
+
+
+# Get node adapter connectivity
+##############################################################################
+def get_node_adapter_connectivity(client):
+    output = ''
+    okcount = 0
+    cmd = 'set -showallfields true; set -showseparator ","; system health node-connectivity adapter show'
+    try:
+        stdin, stdout, stderr = client.exec_command(cmd, get_pty=True)
+        systemhealth = stdout.readlines()[2:]
+        systemhealth = systemhealth[2:-2]
+        error = stderr.read().strip()
+        client.close()
+    except Exception as err:
+        alert_unknown("Unable to get system health status"+str(err))
+        client.close()
+
+    total = len(systemhealth)
+    for sys in systemhealth:
+        try:
+            tmp = sys.split(",")
+            status = tmp[7]
+            node = tmp[0]
+            adapter = tmp[1]
+            slot = tmp[8]
+            port = tmp[9]
+        except Exception as err:
+            alert_unknown(
+                'Problem extracting node adapter connectivity info '+str(err))
+        if status == "ok":
+            okcount += 1
+        else:
+            output += "Adapter {} on Node:{} Slot:{} Port:{} is {} ".format(
+                adapter, node, slot, port, status)
+    if okcount == total:
+        alert_ok('All Adapters reporting OK | ok_count='+str(okcount))
+    elif okcount < total:
+        if args.critical == True:
+            alert_critical(output+' | ok_count='+str(okcount))
+        else:
+            alert_critical(output+' | ok_count='+str(okcount))
+    else:
+        alert_unknown("System is reporting an unclear status ")
+
+
+# Alert Functions
+##############################################################################
+def alert_warning(message):
+    print('WARNING - '+message)
+    sys.exit(ov_warn)
+
+
+def alert_critical(message):
+    print('CRITICAL - '+message)
+    sys.exit(ov_crit)
+
+
+def alert_ok(message):
+    print('OK - '+message)
+    sys.exit(ov_ok)
+
+
+def alert_unknown(message):
+    print('UNKNOWN - '+message)
+    sys.exit(ov_unknown)
+
+
+# Git-r-done!
+##############################################################################
+if args.systemhealth == True:
+    health = get_system_health(client)
+elif args.subsystemhealth == True:
+    get_system_health_subsystem(client)
+elif args.systemconnectivityshelf == True:
+    get_system_connectivity_shelf(client)
+elif args.nodeconnectivityshelf == True:
+    get_node_connectivity_shelf(client)
+elif args.nodeconnectivitydisk == True:
+    get_node_disk_connectivity(client)
+elif args.nodeconnectivityadapter == True:
+    get_node_adapter_connectivity(client)
+else:
+    alert_unknown('No valid mode was found, see --help')

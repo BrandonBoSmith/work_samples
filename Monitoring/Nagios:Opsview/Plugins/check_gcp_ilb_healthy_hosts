@@ -1,0 +1,425 @@
+#!/usr/bin/env python3
+###############################################################################
+'''
+Description:        Opsview Monitoring plugin that will be used to monitor
+                    Google Cloud Internal Load Balancer
+Author:             Bo Smith (bo@bosmith.tech), Dusty Day (dustyday@gmail.com)
+Date:               2020-03-09
+Requirements:       python3, google-cloud-monitoring
+                    json file for a service account
+'''
+###############################################################################
+
+import argparse
+import json
+import sys
+from pprint import pprint
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+
+ok = 0
+warn = 1
+crit = 2
+unknown = 3
+
+
+# Get Args
+###############################################################################
+def get_args():
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description='Opsview plugin to monitor GCP Load Balancer healthy host count\n\n'
+        'This plugin can check for actual host count or a percentage of hosts in the group.\n'
+        'Note that there is a quirk in the GCP API that checks the backend group\n'
+        'for each frontend forwarding rule the load balancer uses.  For example, having\n'
+        'two frontend IP addresses for the LB results in each healthy host being counted\n'
+        'twice.  Three frontend IP addresss would return each healthy host three times.\n'
+        'This should be resolved in a future release of the plugin.',
+        epilog='Examples:\n'
+        'CHECK FOR ACTUAL HOST COUNT\n'
+        'Warn if healthy host count is 2 or less, Critical if 1 or less.\n'
+        '    check_gcp_ilb_healthy_host -l my-prod-loadbalancer-name \\ \n'
+        '        -p my-project -r us-east1 -j svc_acct_creds.json -w 2 -c 1\n'
+        'CHECK FOR PERCENTAGE OF TOTAL HOSTS\n'
+        'Warn if healthy host percentage is 50% or less, Critical if 25% or less.\n'
+        '    check_gcp_ilb_healthy_host -l my-prod-loadbalancer-name \\ \n'
+        '        -p my-project -r us-east1 -j svc_acct_creds.json -w 50 -c 25\n'
+    )
+    required = parser.add_argument_group('required options')
+    output = parser.add_argument_group('output options')
+    threshold = parser.add_argument_group('threshold options')
+
+    required.add_argument(
+        '-j',
+        '--jsonfile',
+        action='store',
+        required=True,
+        help='JSON File with service_account creds.  Must exist in plugins directory unless full path included.'
+    )
+    required.add_argument(
+        '-p',
+        '--project',
+        action='store',
+        required=True,
+        help='GCP Project ID',
+    )
+    required.add_argument(
+        '-r',
+        '--region',
+        action='store',
+        required=True,
+        help='GCP region for the load balancer',
+    )
+    required.add_argument(
+        '-l',
+        '--loadbalancer',
+        action='store',
+        required=True,
+        help='Load balancer name',
+    )
+    # output options
+    output.add_argument(
+        '-d',
+        '--debug',
+        action='store_true',
+        default=False,
+        required=False,
+        help='Show debug output',
+    )
+    output.add_argument(
+        '--format',
+        action='store',
+        choices=['percent', 'raw'],
+        default='raw',
+        required=False,
+        help='Format the returned value (Default is raw)\n'
+             'Note: This formatting is done before evaluating the threshold',
+    )
+    # thresholds
+    threshold.add_argument(
+        '-w',
+        '--warning',
+        action='store',
+        type=float,
+        required=False,
+        help='Warning threshold.',
+    )
+    threshold.add_argument(
+        '-c',
+        '--critical',
+        action='store',
+        type=float,
+        required=False,
+        help='Critical threshold.',
+    )
+
+    args = parser.parse_args()
+    return(args)
+###############################################################################
+
+
+# Setup Service
+###############################################################################
+def setup_service(args):
+    # We need to set up an authenticated 'service' that we will pass to the
+    # various other functions within this plugin
+    try:
+        creds = service_account.Credentials.from_service_account_file(
+            args.jsonfile)
+        svc = build('compute', 'v1', credentials=creds)
+    except Exception as err:
+        send_unknown('Unable to authenticate '+str(err))
+    return(svc)
+###############################################################################
+
+
+# Execute Backend Service Query
+###############################################################################
+def run_backendservice_query(args, service):
+    # Get the backend group(s)
+    inforeq = service.regionBackendServices().get(
+        project=args.project, region=args.region, backendService=args.loadbalancer)
+    try:
+        inforesp = inforeq.execute()
+    except:
+        return None
+    # except Exception as err:
+        # send_unknown('Unable to get backend group name(s) '+str(err))
+    # Initialize empty list
+    backendgroups = []
+    # Get the number of backends for this LB.  Always possible to have more than one
+    grp_count = len(inforesp['backends'])
+    # Build the list of backendgrup names
+    for index in range(0, grp_count):
+        # Get backend group name, get health status of that group, then add status to the list
+        groupuri = inforesp['backends'][index]['group']
+        groupname = groupuri.rpartition('/')[-1]
+        requestbody = {"group": groupuri}
+        request = service.regionBackendServices().getHealth(project=args.project,
+                                                            region=args.region, backendService=args.loadbalancer, body=requestbody)
+        try:
+            response = request.execute()
+        except Exception as err:
+            send_unknown(
+                'Unable to get health status of backend group '+str(err))
+        try:
+            backendgroups.append(
+                {'groupname': groupname, 'instances': response['healthStatus']})
+        except:
+            pass
+
+    return(backendgroups)
+###############################################################################
+
+
+# Execute Target Pool Query
+###############################################################################
+def run_targetpool_query(args, service):
+    targetpools = []
+    try:
+        t = service.targetPools().get(
+            project=args.project,
+            region=args.region,
+            targetPool=args.loadbalancer
+        )
+        tp = t.execute()
+        tmp = {"targetpool": tp['name'], "instances": []}
+        # Get health of each instance
+        for instance in tp['instances']:
+            try:
+                i = service.targetPools().getHealth(
+                    project=args.project,
+                    region=args.region,
+                    targetPool=args.loadbalancer,
+                    body={"instance": instance}
+                )
+                ihealth = i.execute()
+                # pprint(ihealth)
+                tmp['instances'].append(ihealth['healthStatus'][0])
+            except:
+                pass
+        targetpools.append(tmp)
+        return(targetpools)
+    except Exception as err:
+        print(str(err))
+        return None
+
+
+# Process the data we got for the backend groups and return appropriate status
+##############################################################################
+def process_backendservice_data(args, value):
+    # initialize a thing or two
+    message = ''
+    metric = ''
+    host_total = 0
+    healthy_count = 0  # initialize count
+    unhealthy_count = 0  # initialize count
+    healthy_instances = []
+    unhealthy_instances = []  # init unhealthy host list
+
+    # Loops through each backend group to get the group's instance status
+    #  Most LBs will use one backend group but multiple groups are supported.
+    # We want to process all groups and build the entire output message and temporary
+    # data structure first, then check thresholds from that structure after.
+    grp_count = len(value)  # Number of backend groups for this LB
+    for grp_idx in range(0, grp_count):
+        # groupname = value[grp_idx]['groupname'] # not using due to some clients that have lots of groups
+        instances = value[grp_idx]['instances']
+        # Loop through each instance in the group to get status
+        host_total += len(instances)  # Number of instancs in the backend group
+        for instance in instances:
+            instance_name = instance['instance'].rpartition('/')[-1]
+            state = instance['healthState']
+            if state == 'UNHEALTHY':
+                unhealthy_instances.append(instance_name)
+                unhealthy_count += 1
+            else:
+                # This should allow for LBs with multiple frontends
+                if instance_name not in healthy_instances:
+                    healthy_instances.append(instance_name)
+                    healthy_count += 1
+
+    if args.format == 'percent':
+        if host_total == 0:
+            # Here we set metric to 0 if there are no hosts assigned to the lb
+            # in this way we err on the side of caution and alert
+            metric = 0
+        else:
+            metric = round((len(healthy_instances) / host_total) * 100, 2)
+        metric_type = 'percentage'
+        unit = '%'
+    else:
+        metric = len(healthy_instances)
+        metric_type = 'count'
+        unit = ''
+    message += 'Healthy host ' + metric_type + ' is ' + str(metric) + unit
+    if unhealthy_instances:
+        # Include the unhealthy instances if present
+        message += ' Unhealthy instances:' + str(unhealthy_instances)
+    # Tie it all together with a pretty lil bow and perf data
+    message += ' | healthy_host_count='+str(healthy_count)
+    message += ' unhealthy_host_count='+str(unhealthy_count)
+    # Hey kids, let's check for any threshold breaches!
+    # Loop through the temp data structure to determine the highest level of
+    # threshold breach, if any
+    status = ok
+    # If both a warning and critical threshold are defined, start at critical
+    if ((args.warning is not None) and (args.critical is not None)):
+        if (metric <= args.critical):
+            status = max(status, crit)
+        elif (metric <= args.warning):
+            status = max(status, warn)
+        else:
+            status = max(status, ok)
+    # If only the critical threshold is defined, evaluate just critical
+    elif (args.critical is not None):
+        if (metric <= args.critical):
+            status = max(status, crit)
+        else:
+            status = max(status, ok)
+    # If only the warning threshold is defined, evaluate just warning
+    elif (args.warning is not None):
+        if (metric <= args.warning):
+            status = max(status, warn)
+        else:
+            status = max(status, ok)
+    # Now let's return the correct status
+    if status == ok:
+        send_ok(message)
+    elif status == warn:
+        send_warning(message)
+    elif status == crit:
+        send_critical(message)
+
+##############################################################################
+
+
+# Process the data we got for the target groups and return appropriate status
+##############################################################################
+def process_targetpool_data(args, value):
+    # initialize a thing or two
+    message = ''
+    metric = ''
+    host_total = 0
+    healthy_count = 0  # initialize count
+    unhealthy_count = 0  # initialize count
+    healthy_instances = []
+    unhealthy_instances = []  # init unhealthy host list
+
+    # Following is based on process_backendservice_data function
+    # in the interest of time for ToryBurch issue
+    # TODO Clean this up and make efficient
+    for tp in value:
+        # Loop through each instance in the group to get status
+        # Number of instancs in the backend group
+        host_total += len(tp['instances'])
+        for instance in tp['instances']:
+            # pprint(instance)
+            instance_name = instance['instance'].rpartition('/')[-1]
+            state = instance['healthState']
+            if state == 'UNHEALTHY':
+                unhealthy_instances.append(instance_name)
+                unhealthy_count += 1
+            else:
+                # This should allow for LBs with multiple frontends
+                if instance_name not in healthy_instances:
+                    healthy_instances.append(instance_name)
+                    healthy_count += 1
+
+    if args.format == 'percent':
+        if host_total == 0:
+            # Here we set metric to 0 if there are no hosts assigned to the lb
+            # in this way we err on the side of caution and alert
+            metric = 0
+        else:
+            metric = round((len(healthy_instances) / host_total) * 100, 2)
+        metric_type = 'percentage'
+        unit = '%'
+    else:
+        metric = len(healthy_instances)
+        metric_type = 'count'
+        unit = ''
+    message += 'Healthy host ' + metric_type + ' is ' + str(metric) + unit
+    if unhealthy_instances:
+        # Include the unhealthy instances if present
+        message += ' Unhealthy instances:' + str(unhealthy_instances)
+    # Tie it all together with a pretty lil bow and perf data
+    message += ' | healthy_host_count='+str(healthy_count)
+    message += ' unhealthy_host_count='+str(unhealthy_count)
+    # Hey kids, let's check for any threshold breaches!
+    # Loop through the temp data structure to determine the highest level of
+    # threshold breach, if any
+    status = ok
+    # If both a warning and critical threshold are defined, start at critical
+    if ((args.warning is not None) and (args.critical is not None)):
+        if (metric <= args.critical):
+            status = max(status, crit)
+        elif (metric <= args.warning):
+            status = max(status, warn)
+        else:
+            status = max(status, ok)
+    # If only the critical threshold is defined, evaluate just critical
+    elif (args.critical is not None):
+        if (metric <= args.critical):
+            status = max(status, crit)
+        else:
+            status = max(status, ok)
+    # If only the warning threshold is defined, evaluate just warning
+    elif (args.warning is not None):
+        if (metric <= args.warning):
+            status = max(status, warn)
+        else:
+            status = max(status, ok)
+    # Now let's return the correct status
+    if status == ok:
+        send_ok(message)
+    elif status == warn:
+        send_warning(message)
+    elif status == crit:
+        send_critical(message)
+
+##############################################################################
+
+
+# Alert Functions
+##############################################################################
+def send_warning(message):
+    print('WARNING - '+message)
+    sys.exit(warn)
+
+
+def send_critical(message):
+    print('CRITICAL - '+message)
+    sys.exit(crit)
+
+
+def send_ok(message):
+    print('OK - '+message)
+    sys.exit(ok)
+
+
+def send_unknown(message):
+    print('UNKNOWN - '+message)
+    sys.exit(unknown)
+
+
+# Main
+###############################################################################
+def main():
+    args = get_args()
+    service = setup_service(args)
+    value = run_backendservice_query(args, service)
+
+    # Try backendservice first
+    if value != None:
+        process_backendservice_data(args, value)
+    # If no backendservices, check for targetpools
+    elif value is None:
+        value = run_targetpool_query(args, service)
+        process_targetpool_data(args, value)
+        if value == None:
+            send_unknown('Unable to gather metric')
+
+
+if __name__ == '__main__':
+    main()
