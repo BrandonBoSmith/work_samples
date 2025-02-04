@@ -34,7 +34,7 @@ import sys
 ################################################################################
 # PESA Supported Integrations
 ################################################################################
-# TODO Read this data from github.ibm.com/Taos/taos-tf-datadog-modules/monitors
+# TODO Read this data from github 
 pesa_supported = [
     "aws.apigateway.5xx",
     "aws.apigateway.latency",
