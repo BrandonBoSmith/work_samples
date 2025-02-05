@@ -1,0 +1,135 @@
+---
+- hosts: 127.0.0.1
+  connection: local
+  become: yes
+  vars:
+    ansible_python_interpreter: /usr/bin/python
+
+  tasks:
+
+  - name: Enable Extras Repos
+    dnf:
+      enablerepo: extras
+
+  - name: Import Foreman GPG key
+    rpm_key:
+      state: present
+      key: https://yum.theforeman.org/releases/3.13/RPM-GPG-KEY-foreman
+
+  - name: Import Puppet GPG key
+    rpm_key:
+      state: present
+      key: https://yum.puppet.com/RPM-GPG-KEY-puppet
+
+  - name: Install Dependency Packages
+    dnf:
+      name:
+      - epel-release
+      - https://yum.theforeman.org/releases/3.13/el9/x86_64/foreman-release.rpm
+      - https://yum.theforeman.org/katello/4.15/katello/el9/x86_64/katello-repos-latest.rpm
+      - https://yum.puppet.com/puppet8-release-el-9.noarch.rpm
+      state: present
+
+  - name: Install foreman-installer
+    dnf:
+      name: 
+      - foreman-installer-katello
+      state: present
+
+  - name: Deploy Foreman
+    shell: |
+      foreman-installer \
+      --scenario katello \
+      --enable-foreman-proxy \
+      --enable-foreman-plugin-ansible \
+      --enable-foreman-proxy-plugin-ansible \
+      --enable-foreman-plugin-discovery \
+      --enable-foreman-proxy-plugin-discovery \
+      --enable-foreman-plugin-remote-execution \
+      --foreman-proxy-plugin-discovery-install-images=true \
+      --foreman-proxy-tftp=true \
+      --foreman-proxy-tftp-servername=192.168.24.1 \
+      --foreman-proxy-dhcp=true \
+      --foreman-proxy-dhcp-interface=ens19 \
+      --foreman-proxy-dhcp-gateway=192.168.24.1 \
+      --foreman-proxy-dhcp-nameservers="192.168.24.1" \
+      --foreman-proxy-dhcp-range="192.168.24.50 192.168.24.253" \
+      --foreman-proxy-dns=true \
+      --foreman-proxy-dns-interface=ens19 \
+      --foreman-proxy-dns-zone=acsdev.aop.inc \
+      --foreman-proxy-dns-reverse=24.168.192.in-addr.arpa \
+      --foreman-proxy-dns-forwarders=192.168.10.1 \
+      --foreman-proxy-bmc="true" \
+      --foreman-proxy-bmc-ssh-poweron="true" \
+      --foreman-proxy-templates=true \
+      --foreman-proxy-registration=true \
+      --foreman-unattended-url="http://foreman.acs.aop.inc:8080" \
+      --no-enable-puppet \
+      --foreman-server-port=8080 \
+      touch /etc/foreman/installed
+    args:
+      creates: /etc/foreman/installed
+
+  - name: FirewallD Masquerade
+    firewalld:
+      masquerade: true
+      state: enabled
+      permanent: true
+
+  - name: FirewallD Allow Services
+    firewalld:
+      service: "{{ item }}"
+      state: enabled
+      permanent: true
+    with_items:
+    - http
+    - https
+    - tftp
+    - dhcp
+    - dns
+    - ssh
+
+  - name: FirewallD Open tcp Ports
+    firewalld:
+      port: "{{ item }}"
+      state: enabled
+      permanent: true
+    with_items:
+    - 32000/tcp
+    - 9443/tcp
+    - 9090/tcp
+    - 8080/tcp
+    - 4440/tcp
+
+  - name: Setup kubectl
+    shell: |
+      cd /tmp
+      curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+      sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+    args:
+      creates: /usr/local/bin/kubectl
+
+  - name: Setup helm
+    shell: |
+      cd /tmp
+      curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+      chmod 700 get_helm.sh
+      ./get_helm.sh
+    args:
+      creates: /usr/local/bin/helm
+    ignore_errors: true
+
+  handlers:
+  
+  - name: restart httpd
+    systemd:
+      name: httpd
+      state: restarted
+
+  - name: restart foreman-proxy
+    systemd:
+      name: foreman-proxy
+      state: restarted
+
+  - name: reload firewalld
+    shell: firewall-cmd --reload
