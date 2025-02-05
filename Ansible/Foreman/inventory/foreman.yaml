@@ -1,0 +1,13 @@
+---
+plugin: theforeman.foreman.foreman
+# url: export FOREMAN_URL=
+user: ansible
+# password: # export FOREMAN_PASSWORD=
+validate_certs: false
+group_prefix: ""
+host_filters: 'hostgroup="hostgroup1" or hostgroup="hostgroup2" or hostgroup="hostgroup3"'
+want_params: true
+want_facts: true
+use_reports_api: false
+compose:
+  ansible_host: foreman_ipv4
