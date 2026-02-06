@@ -1,0 +1,4 @@
+atlassian-python-api
+dotenv
+gradio
+openai
