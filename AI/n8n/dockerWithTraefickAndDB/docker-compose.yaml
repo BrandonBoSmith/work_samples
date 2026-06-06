@@ -1,0 +1,93 @@
+# docker-compose.yml
+# -------------------------------
+# Persistent volumes
+# -------------------------------
+volumes:
+  traefik_data: {}  # ACME certificate storage
+  pgdata: {}        # PostgreSQL data
+  n8n_data: {}      # n8n user data
+
+# -------------------------------
+# Services
+# -------------------------------
+services:
+
+  traefik:
+    image: traefik
+    container_name: traefik
+    restart: unless-stopped
+    environment:
+      # Traefik looks for env vars only when you use the "envvar" driver:
+      # https://docs.traefik.io/middlewares/redirectregex/#envvar
+      # For simplicity we'll keep the command line definitively; e.g. for certresolver email we
+      # use the docker option `--certificatesresolvers.http.acme.email=${TRAEFIK_EMAIL}`
+      # – so keep it in the command string instead of an env var.
+      # Any other env vars that n8n/Traefik might need can go here.
+      TRAEFIK_EMAIL: ${TRAEFIK_EMAIL}
+    command: |
+      --global.sendanonymoususage=false
+      --log.level=INFO
+      --providers.docker=true
+      --providers.docker.exposedbydefault=false
+      --entrypoints.web.address=:80
+      --entrypoints.websecure.address=:443
+      --certificatesresolvers.http.acme.tlschallenge=true
+      --certificatesresolvers.http.acme.email=${TRAEFIK_EMAIL}
+      --certificatesresolvers.http.acme.storage=/letsencrypt/acme.json
+      --ping
+      --accesslog
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      - "traefik_data:/letsencrypt"
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER}", "-d", "${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: n8n
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      N8N_HOST: ${N8N_HOST}
+      N8N_PROTOCOL: https
+      N8N_PORT: 5678
+      N8N_PROXY_HOPS: 1
+      WEBHOOK_URL: ${WEBHOOK_URL}
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB}
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_USER: ${POSTGRES_USER}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+      # Persist data inside n8n container
+      USER_CONFIG_FOLDER: /home/node/.n8n
+    volumes:
+      - n8n_data:/home/node/.n8n
+    labels:
+      # --------- Traefik router --------
+      traefik.enable: "true"
+      traefik.http.routers.n8n.rule: "Host(`${N8N_HOST}`)"
+      traefik.http.routers.n8n.entrypoints: "websecure"
+      traefik.http.routers.n8n.tls.certresolver: "http"
+      traefik.http.services.n8n.loadbalancer.server.port: "5678"
+      traefik.http.services.n8n.loadbalancer.passHostHeader: "true"
