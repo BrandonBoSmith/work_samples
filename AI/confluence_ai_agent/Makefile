@@ -9,10 +9,8 @@ setup:
 	else \
 		echo ".venv already exists"; \
 	fi
-	@echo "Activating .venv and installing dependencies"
-	@source .venv/bin/activate && \
-		echo "Upgrading pip"; \
-		pip install pip --upgrade; \
-		echo "Installing dependencies"; \
-		pip install -r requirements.txt; \
-		echo "Ready to go"; \
+	@echo "Upgrading pip"
+	@.venv/bin/pip install --upgrade pip
+	@echo "Installing dependencies"
+	@.venv/bin/pip install -r requirements.txt
+	@echo "Ready to go"
