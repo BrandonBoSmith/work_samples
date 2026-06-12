@@ -8,6 +8,8 @@ was directly integrated.
 
 A [Gradio](https://www.gradio.app/) chat UI is provided so you can talk to it in the browser.
 
+![Confluence Agent chat UI](img/screenshot.png)
+
 ## Setup
 
 Run `make setup`, which will:
