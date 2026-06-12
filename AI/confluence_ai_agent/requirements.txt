@@ -1,4 +1,4 @@
 atlassian-python-api
-dotenv
+python-dotenv
 gradio
 openai
